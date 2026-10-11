@@ -1990,11 +1990,11 @@ async function pdfPageLines(page) {
     return { y: ln.y, x: first.x, xEnd: last.x + last.w, size: maxSize || ln.size, text: text.replace(/\s+$/, '') };
   }).filter(l => l.text.trim());
 }
-/** 行 → 段落（识别标题、首行缩进、段间距） */
-function linesToParagraphs(lines) {
+/** 行 → 段落（识别标题、首行缩进、段间距）；bodySize 可传入全文正文字号（默认按本页中位数） */
+function linesToParagraphs(lines, bodySize) {
   if (!lines.length) return [];
   const sizes = lines.map(l => Math.round(l.size * 2) / 2).sort((a, b) => a - b);
-  const body = sizes[Math.floor(sizes.length / 2)] || 10;
+  const body = bodySize || sizes[Math.floor(sizes.length / 2)] || 10;
   const gaps = [];
   for (let i = 1; i < lines.length; i++) { const g = lines[i - 1].y - lines[i].y; if (g > 0 && Math.abs(lines[i].size - body) < 1) gaps.push(g); }
   gaps.sort((a, b) => a - b);
@@ -4301,6 +4301,163 @@ Registry.register({
     const book = await readEpub(await ctx.file.arrayBuffer(), { images: ctx.opts.images }, ctx);
     const html = `<style>.pdfdoc{font-size:${+ctx.opts.fontSize || 16}px}.pdfdoc p{text-indent:2em}</style>` + epubCombinedHtml(book, { toc: true, breaks: true });
     return { name: safeName(book.title || baseName(ctx.file.name)) + '.pdf', blob: await htmlToPdf(html, ctx, { pageSize: ctx.opts.pageSize, quality: 0.8 }) };
+  }
+});
+/** 去除页眉、页脚与页码：页首/页尾两行中，在多页重复出现（数字视为相同）或纯页码的行；字号明显大于正文的行（章节标题）不删除 */
+function stripHeaderFooter(pagesLines, body) {
+  const norm = s => s.replace(/\d+/g, '#').replace(/\s+/g, '').slice(0, 60);
+  const PAGE_NO = /^\s*[-—–]?\s*(第\s*)?\d+\s*(页)?\s*[-—–]?\s*$|^\s*(page\s*)?\d+\s*(of|\/)\s*\d+\s*$|^\s*page\s+\d+\s*$/i;
+  const cnt = new Map();
+  pagesLines.forEach(lines => {
+    new Set([...lines.slice(0, 2), ...lines.slice(-2)].map(l => norm(l.text))).forEach(k => cnt.set(k, (cnt.get(k) || 0) + 1));
+  });
+  const n = pagesLines.filter(l => l.length).length;
+  let removed = 0;
+  const out = pagesLines.map(lines => lines.filter((l, i) => {
+    if (i >= 2 && i < lines.length - 2) return true;
+    if (body && l.size > body * 1.15) return true;
+    const drop = PAGE_NO.test(l.text) || (n >= 3 && cnt.get(norm(l.text)) >= Math.max(3, n * 0.3));
+    if (drop) removed++;
+    return !drop;
+  }));
+  return { out, removed };
+}
+const SENT_END_RE = /[。！？!?.…:：;；"”」』)）\]】]$/;
+Registry.register({
+  id: 'pdf-to-epub', cat: 'ebook', level: 'partial', name: ['PDF 转 EPUB', 'PDF to EPUB'],
+  desc: ['文字型 PDF 重排为电子书：自动分章、去页眉页脚、合并跨页段落；扫描页可 OCR；或用图片模式保留原版式', 'Reflow text PDFs into an e-book: auto chapters, header/footer removal, cross-page paragraphs; OCR for scans; or image mode for exact layout'],
+  inputs: ['pdf'], outputs: ['epub'], libs: ['pdfjs', 'jszip'], exclusive: 'ocr',
+  options: [
+    { id: 'mode', type: 'select', label: ['转换模式', 'Mode'], def: 'text', choices: [['text', '文字重排（可调字号，推荐小说/文档）', 'Reflowable text (novels / documents)'], ['image', '图片模式（每页一张图，保留版式）', 'Image mode (one image per page, exact layout)']] },
+    { id: 'title', type: 'text', label: ['书名（留空=PDF 信息或文件名）', 'Title (empty = PDF info or file name)'], def: '' },
+    { id: 'author', type: 'text', label: ['作者（留空=PDF 信息）', 'Author (empty = PDF info)'], def: '' },
+    { id: 'split', type: 'select', label: ['章节拆分', 'Chapters'], def: 'auto', choices: [['auto', '自动（按大字号标题 / “第X章”）', 'Auto (large headings / "Chapter N")'], ['pages', '按页数分段', 'Every N pages'], ['none', '不拆分', 'No split']], show: o => o.mode === 'text' },
+    { id: 'pagesPer', type: 'number', label: ['每段页数', 'Pages per part'], def: 10, min: 1, max: 500, show: o => o.mode === 'text' && o.split === 'pages', hint: ['自动模式识别不到章节时也按此页数分段', 'Also used when auto mode finds no chapters'] },
+    { id: 'stripHF', type: 'checkbox', label: ['去除页眉、页脚和页码', 'Remove headers, footers and page numbers'], def: true, show: o => o.mode === 'text' },
+    { id: 'joinPages', type: 'checkbox', label: ['合并跨页断开的段落', 'Join paragraphs split across pages'], def: true, show: o => o.mode === 'text' },
+    { id: 'ocr', type: 'select', label: ['OCR（扫描页）', 'OCR (scanned pages)'], def: 'auto', choices: [['auto', '自动：无文字的页才 OCR', 'Auto: only pages without text'], ['off', '关闭', 'Off'], ['all', '全部页面 OCR', 'OCR all pages']], show: o => o.mode === 'text' },
+    { id: 'lang', type: 'select', label: ['OCR 语言', 'OCR language'], def: 'chi_sim+eng', choices: OCR_LANGS, show: o => o.mode === 'text' && o.ocr !== 'off' },
+    { id: 'imgWidth', type: 'select', label: ['页面图片宽度', 'Page image width'], def: 1200, choices: [[900, '900px（文件小）', '900px (smaller)'], [1200, '1200px（推荐）', '1200px (recommended)'], [1600, '1600px（清晰，文件大）', '1600px (sharper, larger)']], show: o => o.mode === 'image' },
+    OPT_PAGES, OPT_PDF_PASSWORD
+  ],
+  limits: [
+    ['只适合“文字型”PDF；扫描版没有文字层，需要 OCR：每页约 5–20 秒，准确率取决于清晰度，错字需人工校对', 'Text-based PDFs only; scans need OCR (~5–20 s/page, accuracy depends on scan quality, proofread required)'],
+    ['文字模式会丢失图片、表格结构、脚注/尾注链接、公式、字体和颜色；表格会变成普通段落', 'Text mode drops images, table structure, footnote links, formulas, fonts and colors; tables become plain paragraphs'],
+    ['多栏排版（论文、杂志）、竖排文字、文字绕图的阅读顺序可能错乱', 'Multi-column layouts, vertical text and text around images may come out in the wrong order'],
+    ['章节靠“标题字号明显大于正文”或“第X章 / Chapter N”格式识别；识别不到时按页数分段，目录可能不理想', 'Chapters rely on larger heading fonts or "第X章 / Chapter N" lines; otherwise split by page count'],
+    ['去页眉页脚按“多页重复出现”判断，可能误删短的重复行或漏删；跨页段落按句末标点合并，偶有误合并', 'Header/footer removal uses repetition and may miss or over-remove; cross-page joining uses punctuation and can occasionally be wrong'],
+    ['部分 PDF 字体编码异常，提取出来是乱码或空白，此时请改用 OCR 或图片模式', 'Some PDFs have broken font encodings and extract as garbage — use OCR or image mode'],
+    ['图片模式保留原版式，但不能调字号、不能搜索文字，在手机上看大开本 PDF 字会很小，文件也较大', 'Image mode keeps layout but text cannot be resized or searched; large pages look small on phones; files are larger'],
+    ['加密 PDF 需填写密码；带 DRM 的电子书类 PDF 无法转换', 'Encrypted PDFs need the password; DRM-protected PDFs cannot be converted']
+  ],
+  tools: ['Calibre（ebook-convert book.pdf book.epub，可配合其“启发式处理”）、ABBYY FineReader（扫描书）', 'Calibre (ebook-convert book.pdf book.epub with heuristics), ABBYY FineReader (scanned books)'],
+  inspect: pdfInspect,
+  async run(ctx) {
+    const o = ctx.opts;
+    const pdf = await openPdf(await ctx.file.arrayBuffer(), o.password);
+    const pages = flatPages(o.pages, pdf.numPages);
+    let info = {};
+    try { info = (await pdf.getMetadata()).info || {}; } catch (e) { info = {}; }
+    const title = String(o.title || info.Title || baseName(ctx.file.name)).trim() || baseName(ctx.file.name);
+    const author = String(o.author || info.Author || '').trim();
+    const chapters = [], images = [];
+    let lang = 'zh';
+    try {
+      if (o.mode === 'image') {
+        for (let i = 0; i < pages.length; i++) {
+          ctx.check(); ctx.progress(i / pages.length, `${i + 1}/${pages.length}`);
+          const pg = await pdf.getPage(pages[i]);
+          const w1 = pg.getViewport({ scale: 1 }).width;
+          const c = await renderPdfPage(pdf, pages[i], clamp((+o.imgWidth || 1200) / w1, 0.3, 5), ctx);
+          const path = `images/p${pad(pages[i], 4)}.jpg`;
+          images.push({ path, mime: 'image/jpeg', bytes: new Uint8Array(await (await canvasToBlob(c, 'image/jpeg', 0.85)).arrayBuffer()) });
+          chapters.push({ title: L([`第 ${pages[i]} 页`, `Page ${pages[i]}`]), body: `<div style="text-align:center;margin:0;padding:0"><img src="${path}" alt="page ${pages[i]}" style="max-width:100%;height:auto"/></div>` });
+          c.width = c.height = 0;
+        }
+      } else {
+        // 1) 逐页提取文字行；无文字的页按设置 OCR
+        const pageLines = [], ocrParas = {};
+        let ocrCount = 0;
+        for (let i = 0; i < pages.length; i++) {
+          ctx.check(); ctx.progress(0.7 * i / pages.length, L([`读取第 ${pages[i]} 页`, `Reading page ${pages[i]}`]));
+          const page = await pdf.getPage(pages[i]);
+          let lines = await pdfPageLines(page);
+          page.cleanup();
+          const len = lines.reduce((a, l) => a + l.text.replace(/\s/g, '').length, 0);
+          if (o.ocr === 'all' || (o.ocr === 'auto' && len < 20)) {
+            await loadLib('tesseract');
+            const c = await renderPdfPage(pdf, pages[i], 200 / 72, ctx);
+            const text = cleanCjkSpaces(await ocrCanvas(c, ctx, o.lang, `${L(['第', 'Page '])}${pages[i]}${L(['页', ''])}`, 0.7 * i / pages.length, 0.7 / pages.length));
+            c.width = c.height = 0;
+            ocrParas[i] = text.replace(/\r\n?/g, '\n').split(/\n\s*\n/).map(p => p.replace(/\n/g, CJK_RE.test(p) ? '' : ' ').trim()).filter(Boolean);
+            ocrCount++;
+            lines = [];
+          }
+          pageLines.push(lines);
+        }
+        // 2) 去页眉页脚；用全书正文字号判断标题，避免“只有章节名的页”被误判
+        const sizesOf = arr => arr.flat().flatMap(l => Array(Math.min(50, Math.max(1, l.text.length))).fill(Math.round(l.size * 2) / 2)).sort((a, b) => a - b);
+        const pre = sizesOf(pageLines);
+        let cleaned = pageLines;
+        if (o.stripHF) { const r = stripHeaderFooter(pageLines, pre.length ? pre[Math.floor(pre.length / 2)] : 0); cleaned = r.out; if (r.removed) ctx.log(`header/footer lines removed: ${r.removed}`); }
+        const allSizes = cleaned.flat().flatMap(l => Array(Math.min(50, Math.max(1, l.text.length))).fill(Math.round(l.size * 2) / 2)).sort((a, b) => a - b);
+        const body = allSizes.length ? allSizes[Math.floor(allSizes.length / 2)] : 0;
+        // 3) 生成段落流，并合并跨页段落
+        const paras = [];
+        cleaned.forEach((lines, i) => {
+          const ps = ocrParas[i] ? ocrParas[i].map(t2 => ({ text: t2, level: 0 })) : linesToParagraphs(lines, body);
+          ps.forEach((p, k) => {
+            const prev = paras[paras.length - 1];
+            if (o.joinPages && k === 0 && prev && prev.page !== i && !prev.level && !p.level && !SENT_END_RE.test(prev.text) && !/^\s*([•·●▪■◆\-–*]|\(?\d{1,3}[.)、])/.test(p.text)) {
+              prev.text += (CJK_RE.test(prev.text.slice(-1)) || CJK_RE.test(p.text[0]) ? '' : ' ') + p.text;
+              prev.page = i;
+            } else paras.push({ text: p.text, level: p.level || 0, page: i });
+          });
+        });
+        if (!paras.length) throw userErr('PDF_NO_TEXT', ['没有提取到任何文字（可能是扫描件或字体无法解析）', 'No text extracted (scanned PDF or unreadable fonts)'], { tips: [['把 OCR 设为“全部页面 OCR”', 'Set OCR to "OCR all pages"'], ['或改用“图片模式”', 'Or use image mode']] });
+        const sample = paras.slice(0, 50).map(p => p.text).join('');
+        lang = (sample.match(new RegExp(CJK_RE.source, 'g')) || []).length > sample.length * 0.2 ? 'zh' : 'en';
+        if (ocrCount) ctx.log(`OCR pages: ${ocrCount}`);
+        // 4) 分章
+        ctx.progress(0.8, L(['分章…', 'Building chapters…']));
+        const isChapRe = p => p.text.length < 60 && CHAPTER_RE.test(p.text);
+        const n1 = paras.filter(p => p.level === 1).length, n12 = paras.filter(p => p.level === 1 || p.level === 2).length;
+        let splitAt = null;
+        if (o.split === 'auto') {
+          if (n1 >= 2) splitAt = p => p.level === 1 || isChapRe(p);
+          else if (n12 >= 2) splitAt = p => p.level === 1 || p.level === 2 || isChapRe(p);
+          else if (paras.filter(isChapRe).length >= 2) splitAt = isChapRe;
+        }
+        const para = p => p.level ? `<h${clamp(p.level + 2, 3, 6)}>${escXml(p.text)}</h${clamp(p.level + 2, 3, 6)}>` : `<p>${escXml(p.text)}</p>`;
+        if (splitAt) {
+          let cur = null;
+          for (const p of paras) {
+            if (splitAt(p)) {
+              // 连续的标题（如“第一章”下一行是章名）合并为同一章标题
+              if (cur && !cur.parts.length) { cur.title += ' ' + p.text; continue; }
+              cur = { title: p.text, parts: [] }; chapters.push(cur);
+            } else {
+              if (!cur) { cur = { title: L(['开篇', 'Opening']), parts: [] }; chapters.push(cur); }
+              cur.parts.push(para(p));
+            }
+          }
+          ctx.log(`chapters by headings: ${chapters.length}`);
+        } else if (o.split === 'none') chapters.push({ title, parts: paras.map(para) });
+        else {
+          if (o.split === 'auto') ctx.warn(L([`未识别到章节标题，已按每 ${+o.pagesPer || 10} 页分段`, `No chapter headings found; split every ${+o.pagesPer || 10} pages`]));
+          const per = Math.max(1, +o.pagesPer || 10);
+          const groups = new Map();
+          for (const p of paras) { const g = Math.floor(p.page / per); if (!groups.has(g)) groups.set(g, []); groups.get(g).push(para(p)); }
+          for (const [g, parts] of groups) {
+            const a = pages[g * per], b = pages[Math.min(pages.length - 1, g * per + per - 1)];
+            chapters.push({ title: a === b ? L([`第 ${a} 页`, `Page ${a}`]) : L([`第 ${a}–${b} 页`, `Pages ${a}–${b}`]), parts });
+          }
+        }
+        chapters.forEach(c => { c.title = c.title.slice(0, 80); c.body = `<h2>${escXml(c.title)}</h2>\n${c.parts.join('\n')}`; delete c.parts; });
+      }
+    } finally { pdf.destroy(); }
+    ctx.progress(0.95, L(['生成 EPUB…', 'Building EPUB…']));
+    return { name: safeName(title) + '.epub', blob: await buildEpub({ title, author, lang, chapters, images }) };
   }
 });
 Registry.register({
