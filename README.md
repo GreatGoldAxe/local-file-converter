@@ -24,7 +24,7 @@ Open the link above, or download `index.html` and double-click it. Pick a featur
 | 图片 | JPG / PNG / WebP / AVIF / GIF / BMP / ICO / TIFF / HEIC / SVG / PSD 互转，压缩、调整尺寸、旋转、透明背景处理 |
 | OCR | 图片 / 扫描 PDF → TXT / Word（Tesseract.js，中英文等） |
 | 数据 / 编码 | JSON / XML / YAML / CSV / Excel 互转，格式化与校验，文本编码转换（GBK / UTF-8 / Big5…），Base64 |
-| 电子书 | EPUB → TXT / HTML / Markdown / Word / PDF；TXT / Markdown / HTML → EPUB；PDF → EPUB（文字重排或图片模式，扫描页可 OCR） |
+| 电子书 | EPUB → TXT / HTML / Markdown / Word / PDF；TXT / Markdown / HTML → EPUB；PDF → EPUB（文字重排或图片模式；有文字层直接用，扫描页 OCR 时过滤乱码、插图裁成图片） |
 | 音视频 | 基于 ffmpeg.wasm 的视频格式转换、提取音频、转 GIF、剪切；无需 ffmpeg 的轻量音频转 WAV / MP3 |
 | PPT | PPTX → PDF / 图片 / 文本；图片 / PDF → PPTX |
 | 其它 | ZIP 解压与打包；iWork / Sketch 预览提取；AI → PDF / PNG |

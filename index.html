@@ -1990,17 +1990,70 @@ async function pdfPageLines(page) {
     return { y: ln.y, x: first.x, xEnd: last.x + last.w, size: maxSize || ln.size, text: text.replace(/\s+$/, '') };
   }).filter(l => l.text.trim());
 }
-/** 行 → 段落（识别标题、首行缩进、段间距）；bodySize 可传入全文正文字号（默认按本页中位数） */
-function linesToParagraphs(lines, bodySize) {
+/** 文字型页面里的插图外框（PDF 坐标 {x0,y0,x1,y1}，y 向上）：遍历绘图指令、跟踪变换矩阵求每张图的外框，
+ *  相邻/重叠的图（被切成条带的大图）合并；忽略小图标（< 页面 3%）和铺满整页的底图（> 85%，如扫描件背景） */
+async function pdfPageImageBoxes(page) {
+  const OPS = pdfjsLib.OPS, ol = await page.getOperatorList();
+  const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [], boxes = [];
+  for (let i = 0; i < ol.fnArray.length; i++) {
+    const fn = ol.fnArray[i], args = ol.argsArray[i];
+    if (fn === OPS.save) stack.push(ctm);
+    else if (fn === OPS.restore) ctm = stack.pop() || ctm;
+    else if (fn === OPS.transform) ctm = mul(ctm, args);
+    else if (fn === OPS.paintFormXObjectBegin) { stack.push(ctm); if (Array.isArray(args[0]) && args[0].length === 6) ctm = mul(ctm, args[0]); }
+    else if (fn === OPS.paintFormXObjectEnd) ctm = stack.pop() || ctm;
+    else if (fn === OPS.beginGroup) { stack.push(ctm); if (args[0] && Array.isArray(args[0].matrix)) ctm = mul(ctm, args[0].matrix); }
+    else if (fn === OPS.endGroup) ctm = stack.pop() || ctm;
+    else if (fn === OPS.paintImageXObject || fn === OPS.paintInlineImageXObject) {
+      // 图片画在单位正方形里
+      const pts = [[0, 0], [1, 0], [0, 1], [1, 1]].map(([x, y]) => [ctm[0] * x + ctm[2] * y + ctm[4], ctm[1] * x + ctm[3] * y + ctm[5]]);
+      boxes.push({ x0: Math.min(...pts.map(p => p[0])), y0: Math.min(...pts.map(p => p[1])), x1: Math.max(...pts.map(p => p[0])), y1: Math.max(...pts.map(p => p[1])) });
+    }
+  }
+  const merged = [];
+  for (const b of boxes) {
+    let cur = { ...b };
+    for (let k = merged.length - 1; k >= 0; k--) {
+      const m = merged[k];
+      if (cur.x0 <= m.x1 + 2 && m.x0 <= cur.x1 + 2 && cur.y0 <= m.y1 + 2 && m.y0 <= cur.y1 + 2) {
+        cur = { x0: Math.min(cur.x0, m.x0), y0: Math.min(cur.y0, m.y0), x1: Math.max(cur.x1, m.x1), y1: Math.max(cur.y1, m.y1) };
+        merged.splice(k, 1);
+      }
+    }
+    merged.push(cur);
+  }
+  const [vx0, vy0, vx1, vy1] = page.view, pa = (vx1 - vx0) * (vy1 - vy0);
+  return merged.map(b => ({ x0: Math.max(b.x0, vx0), y0: Math.max(b.y0, vy0), x1: Math.min(b.x1, vx1), y1: Math.min(b.y1, vy1) }))
+    .filter(b => { const w = b.x1 - b.x0, h = b.y1 - b.y0; return w >= 50 && h >= 40 && w * h >= pa * 0.03 && w * h <= pa * 0.85; });
+}
+/** 拼接上下两行：行尾连字符 + 小写开头 → 去掉连字符合并单词（con- quered → conquered）；大写开头保留连字符（Anglo- Saxon → Anglo-Saxon）；中日韩文字之间不加空格 */
+const LINE_HYPHEN_RE = /[A-Za-z\u00C0-\u024F][-\u2010\u00AD\u00AC]$/;
+function joinLineText(a, b) {
+  a = a.replace(/\s+$/, ''); b = b.replace(/^\s+/, '');
+  if (!a) return b;
+  if (!b) return a;
+  if (LINE_HYPHEN_RE.test(a)) {
+    // 小写开头，或全大写排版里的断词（HISTOR- ICAL）→ 去掉连字符
+    if (/^\p{Ll}/u.test(b) || (/\p{Lu}{2}-?$/u.test(a.slice(-3)) && /^\p{Lu}{2}/u.test(b))) return a.slice(0, -1) + b;
+    if (/^\p{Lu}/u.test(b)) return a.slice(0, -1) + '-' + b;
+  }
+  return a + (CJK_RE.test(a.slice(-1)) || CJK_RE.test(b[0]) ? '' : ' ') + b;
+}
+/** 行 → 段落（识别标题、首行缩进、段间距）；bodySize 可传入全文正文字号（默认按本页中位数）；
+ *  opts.sizeTol：同段允许的字号差（OCR 估算字号有抖动时放宽）；opts.minX/maxR/lineGap：用整栏的左右边界与行距代替本组行的统计。
+ *  返回的段落带 y/x（首行）、left/xEnd（左右范围）、yEnd/lastXEnd（末行）、n（行数）与 indent（首行缩进） */
+function linesToParagraphs(lines, bodySize, opts = {}) {
   if (!lines.length) return [];
   const sizes = lines.map(l => Math.round(l.size * 2) / 2).sort((a, b) => a - b);
   const body = bodySize || sizes[Math.floor(sizes.length / 2)] || 10;
   const gaps = [];
-  for (let i = 1; i < lines.length; i++) { const g = lines[i - 1].y - lines[i].y; if (g > 0 && Math.abs(lines[i].size - body) < 1) gaps.push(g); }
+  for (let i = 1; i < lines.length; i++) { const g = lines[i - 1].y - lines[i].y; if (g > 0 && Math.abs(lines[i].size - body) < (opts.sizeTol || 1)) gaps.push(g); }
   gaps.sort((a, b) => a - b);
-  const lineGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : body * 1.4;
-  const minX = Math.min(...lines.map(l => l.x));
-  const maxR = Math.max(...lines.map(l => l.xEnd));
+  const lineGap = opts.lineGap || (gaps.length ? gaps[Math.floor(gaps.length / 2)] : body * 1.4);
+  const minX = opts.minX ?? Math.min(...lines.map(l => l.x));
+  const maxR = opts.maxR ?? Math.max(...lines.map(l => l.xEnd));
   const paras = [];
   let cur = null;
   const LIST_RE = /^\s*([•·●▪■◆\-–*]|\(?\d{1,3}[.)、]|[一二三四五六七八九十]+[、.])\s*/;
@@ -2011,17 +2064,13 @@ function linesToParagraphs(lines, bodySize) {
     let brk = !cur || !prev;
     if (!brk) {
       const gap = prev.y - l.y;
-      brk = gap > lineGap * 1.5 || gap < 0 || Math.abs(l.size - prev.size) > 1.2 || level !== cur.level
+      brk = gap > lineGap * 1.5 || gap < 0 || Math.abs(l.size - prev.size) > (opts.sizeTol || 1.2) || level !== cur.level
         || (l.x - minX > body * 1.5 && prev.x - minX < body * 0.5)
         || prev.xEnd < maxR - body * 4
         || LIST_RE.test(l.text);
     }
-    if (brk) { cur = { text: l.text.trim(), level, size: l.size }; paras.push(cur); }
-    else {
-      const a = cur.text.slice(-1), b = l.text.trim()[0] || '';
-      if (a === '-' && /[a-z]/i.test(b)) cur.text = cur.text.slice(0, -1) + l.text.trim();
-      else cur.text += (CJK_RE.test(a) || CJK_RE.test(b) ? '' : ' ') + l.text.trim();
-    }
+    if (brk) { cur = { text: l.text.trim(), level, size: l.size, y: l.y, x: l.x, left: l.x, xEnd: l.xEnd, yEnd: l.y, lastXEnd: l.xEnd, n: 1, indent: l.x - minX > body * 1.5 }; paras.push(cur); }
+    else { cur.text = joinLineText(cur.text, l.text); cur.xEnd = Math.max(cur.xEnd, l.xEnd); cur.left = Math.min(cur.left, l.x); cur.yEnd = l.y; cur.lastXEnd = l.xEnd; cur.n++; }
   });
   return paras;
 }
@@ -2979,8 +3028,8 @@ async function getOcrWorker(lang, ctx) {
   return w;
 }
 function killOcr() { if (OCR.worker) { const w = OCR.worker; OCR.worker = null; OCR.lang = null; w.terminate().catch(() => { }); } }
-/** 识别 canvas，返回文字；base/span 用于整体进度 */
-async function ocrCanvas(canvas, ctx, lang, label = '', base = 0, span = 1) {
+/** 运行一次识别，返回 Tesseract 原始结果；params 为本次临时参数（识别后自动恢复），output 选择输出内容 */
+async function ocrRun(canvas, ctx, lang, label, base, span, params = {}, output = { text: true }) {
   const w = await getOcrWorker(lang, ctx);
   OCR.onLog = m => {
     if (m.status === 'recognizing text') ctx.progress(base + span * (m.progress || 0), `${label} OCR ${Math.round((m.progress || 0) * 100)}%`);
@@ -2989,15 +3038,269 @@ async function ocrCanvas(canvas, ctx, lang, label = '', base = 0, span = 1) {
   const onAbort = () => killOcr();
   ctx.signal.addEventListener('abort', onAbort, { once: true });
   try {
-    const { data } = await raceAbort(w.recognize(canvas), ctx);
-    return data.text || '';
+    const { data } = await raceAbort(w.recognize(canvas, params, output), ctx);
+    return data;
   } finally { ctx.signal.removeEventListener('abort', onAbort); OCR.onLog = null; }
+}
+/** 识别 canvas，返回文字；base/span 用于整体进度 */
+async function ocrCanvas(canvas, ctx, lang, label = '', base = 0, span = 1) {
+  return (await ocrRun(canvas, ctx, lang, label, base, span)).text || '';
 }
 /** 去除中文字符之间的多余空格（Tesseract 中文结果常见问题） */
 function cleanCjkSpaces(s) {
   return s.replace(/([⺀-鿿豈-﫿＀-￯　-〿])[ \t]+(?=[⺀-鿿豈-﫿＀-￯　-〿])/g, '$1');
 }
-const OCR_LANGS = [['chi_sim+eng', '简体中文 + 英文', 'Chinese (Simplified) + English'], ['chi_tra+eng', '繁体中文 + 英文', 'Chinese (Traditional) + English'], ['eng', '英文', 'English'], ['jpn+eng', '日文 + 英文', 'Japanese + English'], ['kor+eng', '韩文 + 英文', 'Korean + English'], ['fra+deu+spa+eng', '法/德/西/英', 'French/German/Spanish/English']];
+const OCR_LANGS = [['chi_sim+eng', '简体中文 + 英文', 'Chinese (Simplified) + English'], ['chi_tra+eng', '繁体中文 + 英文', 'Chinese (Traditional) + English'], ['eng', '英文', 'English'], ['jpn+eng', '日文 + 英文', 'Japanese + English'], ['kor+eng', '韩文 + 英文', 'Korean + English'], ['eng+spa', '英文 + 西班牙文', 'English + Spanish'], ['fra+deu+spa+eng', '法/德/西/英', 'French/German/Spanish/English']];
+/* ---------------------------------------------------------------------
+ * 3.11b 扫描页版面 OCR（PDF 转 EPUB 用）：插图区域不识别、裁成图片；
+ *       过滤低置信度/不像单词的乱码；低置信度单词放大后复核
+ * ------------------------------------------------------------------- */
+// 常见短词（英/西/法/德/葡/意）：1–3 个字母的小写词若不在表中，视为“可疑”
+const OCR_SHORT_WORDS = new Set(('a an the of to in on at by for and or but nor so as is it be do go he me my we us am are was not no if up its his her him she you our who how why all any can did had has may one out own say see too two way yet off old new get got let put man men end far few ago age air due eye mr mrs dr st vs etc ' +
+  'de la el en y que los las del se por un una con su al es lo le ya si sí mi tu te yo él ha he ni ese esa eso fue era son sin sus muy hay dos uno tan ver dar vez más mas o e u ' +
+  'les des du une et est au aux ce il on ne pas qui sa son ses par sur der die das und ist ein den dem im zu mit von auf ich er sie os do da dos das em um na é di che per').split(/\s+/));
+const OCR_VOWEL_RE = /[aeiouyàáâãäåæèéêëìíîïòóôõöøœùúûüýÿ]/i;
+const ROMAN_RE = /^M{0,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$/;
+/** 罗马数字常见误识别：XU→XII、XIl→XII、Vl→VI（只处理含 X/V/L/C 且映射后是合法罗马数字的短词） */
+function fixRomanToken(t) {
+  const m = /^([(\[]?)([IVXLCU|l1]{2,6})([.,;:)\]]?)$/.exec(t);
+  if (!m || !/[XVLC]/.test(m[2]) || !/[Ul1|]/.test(m[2])) return t;
+  const r = m[2].replace(/U/g, 'II').replace(/[l1|]/g, 'I');
+  return ROMAN_RE.test(r) ? m[1] + r + m[3] : t;
+}
+/** 单词分类：good 像正常单词 / weak 可疑 / junk 乱码 / neutral 独立标点（不计入） */
+function ocrTokenKind(t, conf) {
+  const core = t.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
+  // 独立标点：破折号、引号、&、法文式空格前的 ; : ! ?、中文全角标点等正常；单独的括号、句点、逗号、竖线等是噪点
+  if (!core) return (/^[—–\-&•·*…§¶"“”'‘’«»%$€£¥°+=:;!?¿¡]+$/.test(t) || CJK_RE.test(t)) && t.length <= 3 ? 'neutral' : 'junk';
+  if (CJK_RE.test(core)) return conf >= 50 ? 'good' : conf >= 25 ? 'weak' : 'junk';
+  // alive—Cuauhtémoc、and/or：按破折号/斜杠拆开分别判断，取最差
+  if (/[—–\/]/.test(core)) { const ks = core.split(/[—–\/]+/).filter(Boolean).map(x => ocrTokenKind(x, conf)); return ks.includes('junk') ? 'junk' : ks.includes('weak') ? 'weak' : 'good'; }
+  if (/^\d+([.,:\/\-]\d+)*(st|nd|rd|th|s|º|ª|°|%)?$/i.test(core)) return 'good';
+  if (core === core.toUpperCase() && ROMAN_RE.test(core)) return 'good';
+  if (!/^\p{L}+(['’\-]\p{L}+)*$/u.test(core) && !/^(\p{L}\.)+\p{L}?$/u.test(core)) return 'junk';
+  if (core.length === 1) return /^[aAIiOoYyEeUu]$/.test(core) ? 'good' : 'weak';
+  if (/\p{Ll}\p{Lu}/u.test(core.replace(/^(Mc|Mac|O['’]|D['’]|L['’])/, ''))) return 'junk';
+  if (core.length >= 4 && !OCR_VOWEL_RE.test(core) && !(core === core.toUpperCase() && core.length <= 5)) return 'junk';
+  if (core.length <= 3 && !OCR_SHORT_WORDS.has(core.toLowerCase())) return 'weak';
+  return 'good';
+}
+/** 整行判定：乱码行（插图、纸张纹理、污点被当成文字）返回 true */
+function ocrLineIsGarbage(words) {
+  const ws = words.filter(w => w.kind !== 'neutral');
+  if (!ws.length) return true;
+  const chars = ws.reduce((a, w) => a + w.text.length, 0);
+  const conf = ws.reduce((a, w) => a + w.conf * w.text.length, 0) / chars;
+  const bad = ws.reduce((a, w) => a + (w.kind === 'junk' ? 1 : w.kind === 'weak' ? 0.6 : 0), 0) / ws.length;
+  const coreLen = w => w.text.replace(/[\p{P}\p{S}]/gu, '').length;
+  const singles = ws.filter(w => coreLen(w) === 1 && !CJK_RE.test(w.text)).length / ws.length;
+  const shorts = ws.filter(w => coreLen(w) <= 2 && !CJK_RE.test(w.text)).length / ws.length;
+  if (ws.length === 1) return ws[0].kind !== 'good' || conf < 55;
+  if (ws.length <= 3) return bad >= 0.5 || conf < 40;
+  return bad >= 0.5 || (bad >= 0.3 && (conf < 70 || shorts >= 0.45)) || conf < 40 || singles >= 0.5;
+}
+/** 找插图区域（不依赖 OCR）：把页面分成小格，统计“墨迹”覆盖率；连成大片的高覆盖格 = 照片/插图。
+ *  返回像素坐标矩形；strong=true 表示整体覆盖率很高、几乎不可能是文字，可直接遮盖不送 OCR。贴着页边的细长条（扫描黑边、书脊阴影）忽略 */
+function findImageRegions(canvas, dpi) {
+  const W = canvas.width, H = canvas.height;
+  const px = canvas.getContext('2d').getImageData(0, 0, W, H).data;
+  const lum = i => (px[i] * 299 + px[i + 1] * 587 + px[i + 2] * 114) / 1000;
+  // 背景亮度 = 亮部直方图的众数
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < px.length; i += 4 * 7) hist[lum(i) | 0]++;
+  let bg = 255;
+  for (let v = 255, best = -1; v >= 100; v--) if (hist[v] > best) { best = hist[v]; bg = v; }
+  const thr = bg - 45;
+  const T = Math.max(16, Math.round(dpi / 8)), cols = Math.ceil(W / T), rows = Math.ceil(H / T);
+  const cov = new Float32Array(cols * rows);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    let ink = 0, tot = 0;
+    for (let y = r * T; y < Math.min(H, r * T + T); y += 2) for (let x = c * T; x < Math.min(W, c * T + T); x += 2) { tot++; if (lum((y * W + x) * 4) < thr) ink++; }
+    cov[r * cols + c] = tot ? ink / tot : 0;
+  }
+  const at = (r, c) => (r < 0 || c < 0 || r >= rows || c >= cols) ? 0 : cov[r * cols + c];
+  const rowMean = (r, a, b) => { let s = 0; for (let c = a; c <= b; c++) s += at(r, c); return s / (b - a + 1); };
+  const colMean = (c, a, b) => { let s = 0; for (let r = a; r <= b; r++) s += at(r, c); return s / (b - a + 1); };
+  const seen = new Uint8Array(cols * rows), regions = [];
+  for (let i = 0; i < cols * rows; i++) {
+    if (seen[i] || cov[i] < 0.4) continue;
+    // 8 邻域连通的高覆盖格
+    const stack = [i]; seen[i] = 1;
+    let r0 = rows, r1 = -1, c0 = cols, c1 = -1, n = 0;
+    while (stack.length) {
+      const k = stack.pop(), r = Math.floor(k / cols), c = k % cols;
+      n++; r0 = Math.min(r0, r); r1 = Math.max(r1, r); c0 = Math.min(c0, c); c1 = Math.max(c1, c);
+      for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
+        const rr = r + dr, cc = c + dc, kk = rr * cols + cc;
+        if (rr >= 0 && cc >= 0 && rr < rows && cc < cols && !seen[kk] && cov[kk] >= 0.4) { seen[kk] = 1; stack.push(kk); }
+      }
+    }
+    // 向外扩展到照片的浅色部分
+    for (let grow = true; grow;) {
+      grow = false;
+      if (r0 > 0 && rowMean(r0 - 1, c0, c1) >= 0.22) { r0--; grow = true; }
+      if (r1 < rows - 1 && rowMean(r1 + 1, c0, c1) >= 0.22) { r1++; grow = true; }
+      if (c0 > 0 && colMean(c0 - 1, r0, r1) >= 0.22) { c0--; grow = true; }
+      if (c1 < cols - 1 && colMean(c1 + 1, r0, r1) >= 0.22) { c1++; grow = true; }
+    }
+    const w = (c1 - c0 + 1) * T, h = (r1 - r0 + 1) * T, area = (c1 - c0 + 1) * (r1 - r0 + 1);
+    if (w < dpi * 0.8 || h < dpi * 0.6 || w * h < W * H * 0.02 || n / area < 0.35) continue;
+    const edge = r0 === 0 || c0 === 0 || r1 === rows - 1 || c1 === cols - 1;
+    if (edge && (w / h > 4 || h / w > 4)) continue;
+    let all = 0; for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) all += at(r, c);
+    regions.push({ x0: c0 * T, y0: r0 * T, x1: Math.min(W, (c1 + 1) * T), y1: Math.min(H, (r1 + 1) * T), strong: all / area >= 0.45 });
+  }
+  return { regions, bg };
+}
+const boxInter = (a, b) => Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0)) * Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+const boxArea = b => (b.x1 - b.x0) * (b.y1 - b.y0);
+/** 裁剪 canvas 区域为 JPEG 字节（最宽 maxW 像素） */
+async function cropToJpeg(canvas, b, maxW = 1200) {
+  const w = b.x1 - b.x0, h = b.y1 - b.y0, k = Math.min(1, maxW / w);
+  const c = makeCanvas(Math.max(1, Math.round(w * k)), Math.max(1, Math.round(h * k)));
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.drawImage(canvas, b.x0, b.y0, w, h, 0, 0, c.width, c.height);
+  const bytes = new Uint8Array(await (await canvasToBlob(c, 'image/jpeg', 0.85)).arrayBuffer());
+  c.width = c.height = 0;
+  return bytes;
+}
+/** 区域内墨迹比例（区分“插图”与“空白 / 纸张纹理”） */
+function inkRatio(canvas, b, bg) {
+  const d = canvas.getContext('2d').getImageData(b.x0, b.y0, Math.max(1, b.x1 - b.x0), Math.max(1, b.y1 - b.y0)).data;
+  let ink = 0, tot = 0;
+  for (let i = 0; i < d.length; i += 4 * 3) { tot++; if ((d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 < bg - 45) ink++; }
+  return tot ? ink / tot : 0;
+}
+/** 区域是否“像文字排版”：水平投影里有足够多的空白行（行与行之间的间隙）；插图很少有整行空白 */
+function looksLikeTextRows(canvas, b, bg) {
+  const w = Math.max(1, b.x1 - b.x0), h = Math.max(1, b.y1 - b.y0);
+  const d = canvas.getContext('2d').getImageData(b.x0, b.y0, w, h).data;
+  let blank = 0;
+  for (let y = 0; y < h; y++) {
+    let ink = 0, tot = 0;
+    for (let x = 0; x < w; x += 2) { const i = (y * w + x) * 4; tot++; if ((d[i] * 299 + d[i + 1] * 587 + d[i + 2] * 114) / 1000 < bg - 45) ink++; }
+    if (ink / tot < 0.005) blank++;
+  }
+  return blank / h >= 0.25;
+}
+/** 识别质量（自动选语言用）：score = 可信字符数 × 平均置信度 */
+function ocrQuality(lines) {
+  let good = 0, all = 0, conf = 0;
+  for (const l of lines) for (const w of l.words) { const n = w.text.length; all += n; conf += w.conf * n; if (w.kind === 'good') good += n; }
+  return { score: good * (all ? conf / all : 0) / 100, good: all ? good / all : 0, conf: all ? conf / all : 0 };
+}
+/** Tesseract 结果 → 带分类的行（像素坐标） */
+function ocrDataLines(data) {
+  const out = [];
+  (data.blocks || []).forEach((b, bi) => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => {
+    const words = (l.words || []).map(w => ({ text: fixRomanToken(String(w.text || '').trim()), conf: w.confidence, bbox: w.bbox })).filter(w => w.text);
+    words.forEach(w => { w.kind = ocrTokenKind(w.text, w.conf); });
+    if (words.length) out.push({ blk: bi, bbox: l.bbox, row: l.rowAttributes || {}, baseline: l.baseline, words });
+  })));
+  return out;
+}
+/**
+ * 扫描页 OCR → { lines, images, stats }
+ *  lines：与 pdfPageLines 相同的结构（PDF 点坐标，y 向上），另带 blk（Tesseract 版面块序号，多栏时每栏一块）
+ *  images：插图 { bytes, y, x, xEnd }（y 为插图顶边）
+ *  opts：{ lang, images, label, base, span }；lang 为 null 时在 eng+spa 与 chi_sim+eng 中自动选更好的，并写回 opts.lang
+ */
+async function ocrScannedPage(pdf, n, ctx, opts) {
+  const dpi = 200, scale = dpi / 72;
+  const c = await renderPdfPage(pdf, n, scale, ctx);
+  const W = c.width, H = c.height;
+  const stats = { droppedLines: 0, droppedWords: 0, rechecked: 0, fixed: 0, images: 0 };
+  const found = opts.images ? findImageRegions(c, dpi) : { regions: [], bg: 255 };
+  const cands = found.regions.slice();
+  // 1) “确定是图”的区域涂成背景色，不送 OCR
+  let src = c;
+  if (cands.some(r => r.strong)) {
+    src = makeCanvas(W, H);
+    const g = src.getContext('2d'); g.drawImage(c, 0, 0); g.fillStyle = `rgb(${found.bg},${found.bg},${found.bg})`;
+    cands.filter(r => r.strong).forEach(r => g.fillRect(r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0));
+  }
+  // 2) 版面分析模式（PSM 3：自动分栏、区分文字块与图片块）
+  const run = lang => ocrRun(src, ctx, lang, opts.label, opts.base, opts.span, { tessedit_pageseg_mode: '3' }, { text: true, blocks: true });
+  let data, lines;
+  if (opts.lang) { data = await run(opts.lang); lines = ocrDataLines(data); }
+  else {
+    data = await run('eng+spa'); lines = ocrDataLines(data);
+    const q1 = ocrQuality(lines);
+    opts.lang = 'eng+spa';
+    if (q1.good < 0.75 || q1.conf < 70) {
+      const d2 = await run('chi_sim+eng'), l2 = ocrDataLines(d2);
+      if (ocrQuality(l2).score > q1.score * 1.15) { data = d2; lines = l2; opts.lang = 'chi_sim+eng'; }
+    }
+    ctx.log(`OCR language (auto): ${opts.lang}`);
+  }
+  if (opts.images) (data.blocks || []).forEach(b => { if (/IMAGE/.test(b.blocktype || '') && b.bbox) cands.push({ ...b.bbox, strong: false }); });
+  // 3) 低置信度但像单词的词：放大后单独复核（PSM 8 单词模式），取置信度更高的结果
+  const low = lines.flatMap(l => l.words.filter(w => w.conf < 60 && w.kind !== 'junk' && w.text.length >= 2)).slice(0, 40);
+  for (const w of low) {
+    ctx.check();
+    const b = w.bbox, pd = Math.round((b.y1 - b.y0) * 0.35);
+    const box = { x0: Math.max(0, b.x0 - pd), y0: Math.max(0, b.y0 - pd), x1: Math.min(W, b.x1 + pd), y1: Math.min(H, b.y1 + pd) };
+    const k = clamp(90 / Math.max(1, b.y1 - b.y0), 1, 3);
+    const cc = makeCanvas(Math.round((box.x1 - box.x0) * k), Math.round((box.y1 - box.y0) * k));
+    cc.getContext('2d').drawImage(src, box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0, 0, 0, cc.width, cc.height);
+    const d = await ocrRun(cc, ctx, opts.lang, opts.label, opts.base + opts.span, 0, { tessedit_pageseg_mode: '8' }, { text: true });
+    cc.width = cc.height = 0;
+    stats.rechecked++;
+    const strip = x => x.replace(/^[\p{P}\p{S}]+|[\p{P}\p{S}]+$/gu, '');
+    const core0 = strip(w.text), core1 = strip(String(d.text || '').replace(/\s+/g, ''));
+    const t = core1 && core0 ? fixRomanToken(w.text.replace(core0, core1)) : '';
+    if (t && d.confidence > w.conf + 5 && ocrTokenKind(t, d.confidence) !== 'junk' && Math.abs(core1.length - core0.length) <= 1) {
+      if (t !== w.text) stats.fixed++;
+      w.text = t; w.conf = d.confidence; w.kind = ocrTokenKind(t, w.conf);
+    }
+  }
+  // 4) 乱码过滤：乱码行整行丢弃；保留的行里去掉低置信度的乱码词；落在插图区域里的字一律不要
+  const inCand = bb => cands.some(r => boxInter(r, bb) > 0.5 * boxArea(bb));
+  const kept = [], garbage = [];
+  for (const l of lines) {
+    if (ocrLineIsGarbage(l.words) || inCand(l.bbox)) { garbage.push(l); continue; }
+    const before = l.words.length;
+    l.words = l.words.filter((w, i) => !(w.kind === 'junk' && (w.conf < 85 || w.text.replace(/[\p{P}\p{S}]/gu, '').length <= 2 || i === 0 || i === l.words.length - 1)) && !(w.kind === 'weak' && w.conf < 30) && !inCand(w.bbox));
+    stats.droppedWords += before - l.words.length;
+    if (l.words.some(w => w.kind !== 'neutral')) kept.push(l); else garbage.push(l);
+  }
+  stats.droppedLines = garbage.length;
+  // 5) 插图：候选区域里没有可信文字 → 裁成图片；大片连续乱码（OCR 把插图当成了文字）且墨迹足够、又不像成行的文字 → 也裁成图片，否则视为纸张纹理/印刷噪点直接丢弃
+  const hasText = b => kept.some(l => boxInter(b, l.bbox) > 0.5 * boxArea(l.bbox));
+  const imgBoxes = [];
+  for (const r of cands) if (!hasText(r) && !imgBoxes.some(b => boxInter(b, r) > 0)) imgBoxes.push(r);
+  if (opts.images) {
+    const hs = kept.map(l => l.bbox.y1 - l.bbox.y0).sort((a, b) => a - b);
+    const lineH = hs.length ? hs[Math.floor(hs.length / 2)] : dpi / 6;
+    let cl = null;
+    const flush = () => {
+      if (cl && cl.y1 - cl.y0 >= lineH * 4 && cl.x1 - cl.x0 >= dpi * 1.2 && !imgBoxes.some(b => boxInter(b, cl) > 0) && !hasText(cl) && inkRatio(c, cl, found.bg) >= 0.04 && !looksLikeTextRows(c, cl, found.bg)) imgBoxes.push(cl);
+      cl = null;
+    };
+    for (const l of lines) {
+      if (!garbage.includes(l)) { flush(); continue; }
+      const b = l.bbox;
+      if (cl && b.y0 - cl.y1 < lineH * 2 && Math.min(b.x1, cl.x1) > Math.max(b.x0, cl.x0)) cl = { x0: Math.min(cl.x0, b.x0), y0: Math.min(cl.y0, b.y0), x1: Math.max(cl.x1, b.x1), y1: Math.max(cl.y1, b.y1) };
+      else { flush(); cl = { ...b }; }
+    }
+    flush();
+  }
+  const images = [];
+  for (const b of imgBoxes) images.push({ bytes: await cropToJpeg(c, b), y: (H - b.y0) / scale, x: b.x0 / scale, xEnd: b.x1 / scale });
+  stats.images = images.length;
+  if (src !== c) src.width = src.height = 0;
+  c.width = c.height = 0;
+  // 6) 转成 pdfPageLines 的行结构：字号 ≈（行高 + 下伸部）/ 0.9，像素换算成 PDF 点
+  const outLines = kept.map(l => {
+    const rh = l.row.row_height ? l.row.row_height + (l.row.descenders || 0) : l.bbox.y1 - l.bbox.y0;
+    const bl = l.baseline && isFinite(l.baseline.y0) ? (l.baseline.y0 + l.baseline.y1) / 2 : l.bbox.y1 - (l.row.descenders || 0);
+    return { y: (H - bl) / scale, x: l.words[0].bbox.x0 / scale, xEnd: l.words[l.words.length - 1].bbox.x1 / scale, size: rh / 0.9 / scale, text: cleanCjkSpaces(l.words.map((w, k) => (k && !(/^[—–]$/.test(l.words[k - 1].text) && w.bbox.x0 - l.words[k - 1].bbox.x1 < (w.bbox.y1 - w.bbox.y0) * 0.4) ? ' ' : '') + w.text).join('')), blk: l.blk };
+  });
+  // OCR 估算的字号逐行抖动较大：与本页中位数相差 20% 以内的统一成中位数，只保留明显更大（标题）或更小（注释）的差异
+  const ss = outLines.map(l => l.size).sort((a, b) => a - b), med = ss[Math.floor(ss.length / 2)];
+  outLines.forEach(l => { if (Math.abs(l.size / med - 1) <= 0.2) l.size = med; });
+  return { lines: outLines, images, stats };
+}
 /** OCR 结果文本 → DOCX 段落 */
 function textToDocxParas(db, text) {
   return text.replace(/\r\n?/g, '\n').split(/\n\s*\n/).map(p => p.replace(/\n/g, CJK_RE.test(p) ? '' : ' ').trim()).filter(Boolean).map(p => db.para(db.run(p)));
@@ -4323,6 +4626,19 @@ function stripHeaderFooter(pagesLines, body) {
   return { out, removed };
 }
 const SENT_END_RE = /[。！？!?.…:：;；"”」』)）\]】]$/;
+const PARA_LIST_RE = /^\s*([•·●▪■◆\-–—*]|\(?\d{1,3}[.)、])/;
+/** 能否把段落 p 接到上一段后面：上一段不是标题/图片且没有以句末标点结束；p 不是标题、列表项、首行缩进的新段或短的全大写单行（CONTENTS、署名） */
+const canJoinPara = (prev, p) => !!prev && !prev.img && !prev.level && !p.level && !p.indent && !SENT_END_RE.test(prev.text) && !PARA_LIST_RE.test(p.text)
+  && !(p.n === 1 && p.text.length < 40 && /\p{Lu}/u.test(p.text) && p.text === p.text.toUpperCase());
+/** 把插图按位置插入本页段落序列：放在“同一栏中第一个位于图片顶边下方的段落”之前（坐标 y 向上） */
+function placeImages(ps, imgs) {
+  for (const im of imgs) {
+    let k = ps.findIndex(p => !p.img && p.y < im.y && p.left < im.xEnd && p.xEnd > im.x);
+    if (k < 0) k = ps.findIndex(p => !p.img && p.y < im.y);
+    const item = { img: im.path, text: '', level: 0 };
+    if (k < 0) ps.push(item); else ps.splice(k, 0, item);
+  }
+}
 Registry.register({
   id: 'pdf-to-epub', cat: 'ebook', level: 'partial', name: ['PDF 转 EPUB', 'PDF to EPUB'],
   desc: ['文字型 PDF 重排为电子书：自动分章、去页眉页脚、合并跨页段落；扫描页可 OCR；或用图片模式保留原版式', 'Reflow text PDFs into an e-book: auto chapters, header/footer removal, cross-page paragraphs; OCR for scans; or image mode for exact layout'],
@@ -4335,14 +4651,17 @@ Registry.register({
     { id: 'pagesPer', type: 'number', label: ['每段页数', 'Pages per part'], def: 10, min: 1, max: 500, show: o => o.mode === 'text' && o.split === 'pages', hint: ['自动模式识别不到章节时也按此页数分段', 'Also used when auto mode finds no chapters'] },
     { id: 'stripHF', type: 'checkbox', label: ['去除页眉、页脚和页码', 'Remove headers, footers and page numbers'], def: true, show: o => o.mode === 'text' },
     { id: 'joinPages', type: 'checkbox', label: ['合并跨页断开的段落', 'Join paragraphs split across pages'], def: true, show: o => o.mode === 'text' },
-    { id: 'ocr', type: 'select', label: ['OCR（扫描页）', 'OCR (scanned pages)'], def: 'auto', choices: [['auto', '自动：无文字的页才 OCR', 'Auto: only pages without text'], ['off', '关闭', 'Off'], ['all', '全部页面 OCR', 'OCR all pages']], show: o => o.mode === 'text' },
-    { id: 'lang', type: 'select', label: ['OCR 语言', 'OCR language'], def: 'chi_sim+eng', choices: OCR_LANGS, show: o => o.mode === 'text' && o.ocr !== 'off' },
+    { id: 'ocr', type: 'select', label: ['OCR（扫描页）', 'OCR (scanned pages)'], def: 'auto', choices: [['auto', '自动：有文字层的页直接用文字层，无文字的页才 OCR', 'Auto: use the text layer when present, OCR only pages without text'], ['off', '关闭', 'Off'], ['all', '全部页面 OCR', 'OCR all pages']], show: o => o.mode === 'text' },
+    { id: 'lang', type: 'select', label: ['OCR 语言', 'OCR language'], def: 'auto', choices: [['auto', '自动（英文+西班牙文，识别不佳时改用中文）', 'Auto (English+Spanish, falls back to Chinese)'], ...OCR_LANGS], show: o => o.mode === 'text' && o.ocr !== 'off' },
+    { id: 'images', type: 'checkbox', label: ['保留插图（裁成图片插入正文）', 'Keep illustrations (embedded as images)'], def: true, show: o => o.mode === 'text', hint: ['扫描页中的插图区域不做 OCR，直接作为图片插入', 'Image regions on scanned pages are not OCR\'d; they are embedded as pictures'] },
     { id: 'imgWidth', type: 'select', label: ['页面图片宽度', 'Page image width'], def: 1200, choices: [[900, '900px（文件小）', '900px (smaller)'], [1200, '1200px（推荐）', '1200px (recommended)'], [1600, '1600px（清晰，文件大）', '1600px (sharper, larger)']], show: o => o.mode === 'image' },
     OPT_PAGES, OPT_PDF_PASSWORD
   ],
   limits: [
     ['只适合“文字型”PDF；扫描版没有文字层，需要 OCR：每页约 5–20 秒，准确率取决于清晰度，错字需人工校对', 'Text-based PDFs only; scans need OCR (~5–20 s/page, accuracy depends on scan quality, proofread required)'],
-    ['文字模式会丢失图片、表格结构、脚注/尾注链接、公式、字体和颜色；表格会变成普通段落', 'Text mode drops images, table structure, footnote links, formulas, fonts and colors; tables become plain paragraphs'],
+    ['文字模式会丢失表格结构、脚注/尾注链接、公式、字体和颜色；表格会变成普通段落；插图按位置裁成图片插入，图文混排时位置可能有偏差', 'Text mode drops table structure, footnote links, formulas, fonts and colors; tables become plain paragraphs; illustrations are cropped and inserted by position, which may be slightly off in complex layouts'],
+    ['扫描页乱码过滤按“置信度 + 是否像单词”判断：个别生僻词、缩写可能被误删，少量乱码可能残留；小号大写字母上的重音（如 JOSÉ）有时仍识别成无重音', 'Scanned-page garbage filtering uses confidence and word-likeness: rare words or abbreviations may be removed and some noise may remain; accents on small caps (e.g. JOSÉ) are sometimes still lost'],
+    ['插图检测依据墨迹密度：很浅的插图可能被漏掉、深色底的文字框可能被当成图片；“自动”语言会先用英文+西班牙文，识别差时再试中文（首个扫描页多花一次识别时间）', 'Illustration detection uses ink density: very light pictures may be missed and dark text boxes may be treated as images; "Auto" language tries English+Spanish first, then Chinese (one extra OCR pass on the first scanned page)'],
     ['多栏排版（论文、杂志）、竖排文字、文字绕图的阅读顺序可能错乱', 'Multi-column layouts, vertical text and text around images may come out in the wrong order'],
     ['章节靠“标题字号明显大于正文”或“第X章 / Chapter N”格式识别；识别不到时按页数分段，目录可能不理想', 'Chapters rely on larger heading fonts or "第X章 / Chapter N" lines; otherwise split by page count'],
     ['去页眉页脚按“多页重复出现”判断，可能误删短的重复行或漏删；跨页段落按句末标点合并，偶有误合并', 'Header/footer removal uses repetition and may miss or over-remove; cross-page joining uses punctuation and can occasionally be wrong'],
@@ -4375,25 +4694,44 @@ Registry.register({
           c.width = c.height = 0;
         }
       } else {
-        // 1) 逐页提取文字行；无文字的页按设置 OCR
-        const pageLines = [], ocrParas = {};
+        // 1) 逐页提取文字行：有文字层的页直接用文字层；无文字层（扫描页）才 OCR。插图裁成图片
+        const pageLines = [], pageImgs = [];
+        const ocrOpts = { lang: o.lang === 'auto' ? null : o.lang, images: !!o.images };
+        const st = { droppedLines: 0, droppedWords: 0, rechecked: 0, fixed: 0, images: 0 };
         let ocrCount = 0;
         for (let i = 0; i < pages.length; i++) {
           ctx.check(); ctx.progress(0.7 * i / pages.length, L([`读取第 ${pages[i]} 页`, `Reading page ${pages[i]}`]));
           const page = await pdf.getPage(pages[i]);
           let lines = await pdfPageLines(page);
-          page.cleanup();
           const len = lines.reduce((a, l) => a + l.text.replace(/\s/g, '').length, 0);
+          const imgs = [];
+          const addImg = (bytes, pos) => { const path = `images/p${pad(pages[i], 4)}_${imgs.length + 1}.jpg`; images.push({ path, mime: 'image/jpeg', bytes }); imgs.push({ ...pos, path }); };
           if (o.ocr === 'all' || (o.ocr === 'auto' && len < 20)) {
             await loadLib('tesseract');
-            const c = await renderPdfPage(pdf, pages[i], 200 / 72, ctx);
-            const text = cleanCjkSpaces(await ocrCanvas(c, ctx, o.lang, `${L(['第', 'Page '])}${pages[i]}${L(['页', ''])}`, 0.7 * i / pages.length, 0.7 / pages.length));
-            c.width = c.height = 0;
-            ocrParas[i] = text.replace(/\r\n?/g, '\n').split(/\n\s*\n/).map(p => p.replace(/\n/g, CJK_RE.test(p) ? '' : ' ').trim()).filter(Boolean);
+            Object.assign(ocrOpts, { label: `${L(['第', 'Page '])}${pages[i]}${L(['页', ''])}`, base: 0.7 * i / pages.length, span: 0.7 / pages.length });
+            const r = await ocrScannedPage(pdf, pages[i], ctx, ocrOpts);
+            lines = r.lines;
+            r.images.forEach(im => addImg(im.bytes, im));
+            for (const k in st) st[k] += r.stats[k] || 0;
             ocrCount++;
-            lines = [];
+          } else if (o.images) {
+            // 文字层页面：按绘图指令找插图，渲染后裁剪
+            const boxes = await pdfPageImageBoxes(page);
+            if (boxes.length) {
+              const s = clamp(1200 / Math.max(...boxes.map(b => b.x1 - b.x0)), 1, 3);
+              const c = await renderPdfPage(pdf, pages[i], s, ctx), vp = page.getViewport({ scale: s });
+              for (const b of boxes) {
+                const [ax, ay, bx, by] = vp.convertToViewportRectangle([b.x0, b.y0, b.x1, b.y1]);
+                const px = { x0: Math.max(0, Math.floor(Math.min(ax, bx))), y0: Math.max(0, Math.floor(Math.min(ay, by))), x1: Math.min(c.width, Math.ceil(Math.max(ax, bx))), y1: Math.min(c.height, Math.ceil(Math.max(ay, by))) };
+                if (px.x1 - px.x0 > 4 && px.y1 - px.y0 > 4) addImg(await cropToJpeg(c, px), { y: b.y1, x: b.x0, xEnd: b.x1 });
+              }
+              c.width = c.height = 0;
+              st.images += imgs.length;
+            }
           }
+          page.cleanup();
           pageLines.push(lines);
+          pageImgs.push(imgs);
         }
         // 2) 去页眉页脚；用全书正文字号判断标题，避免“只有章节名的页”被误判
         const sizesOf = arr => arr.flat().flatMap(l => Array(Math.min(50, Math.max(1, l.text.length))).fill(Math.round(l.size * 2) / 2)).sort((a, b) => a - b);
@@ -4402,22 +4740,51 @@ Registry.register({
         if (o.stripHF) { const r = stripHeaderFooter(pageLines, pre.length ? pre[Math.floor(pre.length / 2)] : 0); cleaned = r.out; if (r.removed) ctx.log(`header/footer lines removed: ${r.removed}`); }
         const allSizes = cleaned.flat().flatMap(l => Array(Math.min(50, Math.max(1, l.text.length))).fill(Math.round(l.size * 2) / 2)).sort((a, b) => a - b);
         const body = allSizes.length ? allSizes[Math.floor(allSizes.length / 2)] : 0;
-        // 3) 生成段落流，并合并跨页段落
+        // 3) 生成段落流（行合并成段、修复行尾连字符），插入插图，并合并跨页段落
         const paras = [];
         cleaned.forEach((lines, i) => {
-          const ps = ocrParas[i] ? ocrParas[i].map(t2 => ({ text: t2, level: 0 })) : linesToParagraphs(lines, body);
+          // OCR 页按版面块（分栏）分别成段；块与块之间若句子没结束则续接
+          const groups = [];
+          for (const l of lines) { const g = groups[groups.length - 1]; if (g && g.blk === l.blk) g.lines.push(l); else groups.push({ blk: l.blk, lines: [l] }); }
+          // 所在栏的左右边界：与给定水平范围重叠的所有行
+          const colOf = (a0, b0) => { let a = Infinity, b = -Infinity; for (const l of lines) if (l.x < b0 && l.xEnd > a0) { a = Math.min(a, l.x); b = Math.max(b, l.xEnd); } return [a, b]; };
+          // 版面块之间是否连续：上一段末行写满到栏右侧、下一段首行不缩进，且紧接在下方（行距正常），或上一段较长、转到右侧新栏的顶部
+          const flows = (prev, p) => {
+            if (prev.lastXEnd < colOf(prev.left, prev.xEnd)[1] - body * 3 || p.x - colOf(p.left, p.xEnd)[0] > body * 0.8) return false;
+            const gap = prev.yEnd - p.y;
+            return (gap > 0 && gap <= body * 2.2) || (gap < 0 && prev.n >= 2 && p.x >= prev.xEnd - body);
+          };
+          // OCR 页：全页正文行距（同一块内相邻行基线差的中位数）
+          const lg = [];
+          for (let k = 1; k < lines.length; k++) { const d = lines[k - 1].y - lines[k].y; if (lines[k].blk !== undefined && lines[k].blk === lines[k - 1].blk && d > 0 && d < body * 3) lg.push(d); }
+          lg.sort((a, b) => a - b);
+          const ps = [];
+          for (const g of groups) {
+            let lo = {};
+            if (g.blk !== undefined) {
+              const [minX, maxR] = colOf(Math.min(...g.lines.map(l => l.x)), Math.max(...g.lines.map(l => l.xEnd)));
+              lo = { sizeTol: Math.max(1.2, body * 0.15), minX, maxR, lineGap: lg.length ? lg[Math.floor(lg.length / 2)] : 0 };
+            }
+            linesToParagraphs(g.lines, body, lo).forEach((p, k) => {
+              const prev = ps[ps.length - 1];
+              if (k === 0 && canJoinPara(prev, p) && flows(prev, p)) prev.text = joinLineText(prev.text, p.text); else ps.push(p);
+            });
+          }
+          placeImages(ps, pageImgs[i]);
           ps.forEach((p, k) => {
-            const prev = paras[paras.length - 1];
-            if (o.joinPages && k === 0 && prev && prev.page !== i && !prev.level && !p.level && !SENT_END_RE.test(prev.text) && !/^\s*([•·●▪■◆\-–*]|\(?\d{1,3}[.)、])/.test(p.text)) {
-              prev.text += (CJK_RE.test(prev.text.slice(-1)) || CJK_RE.test(p.text[0]) ? '' : ' ') + p.text;
-              prev.page = i;
-            } else paras.push({ text: p.text, level: p.level || 0, page: i });
+            // 跨页续接：跳过上一页末尾的插图，接到最后一个文字段落上
+            let j = paras.length - 1;
+            while (j >= 0 && paras[j].img) j--;
+            const prev = j >= 0 ? paras[j] : null;
+            if (o.joinPages && k === 0 && !p.img && prev && prev.page !== i && canJoinPara(prev, p)) { prev.text = joinLineText(prev.text, p.text); prev.page = i; }
+            else paras.push({ text: p.text || '', level: p.level || 0, page: i, img: p.img });
           });
         });
         if (!paras.length) throw userErr('PDF_NO_TEXT', ['没有提取到任何文字（可能是扫描件或字体无法解析）', 'No text extracted (scanned PDF or unreadable fonts)'], { tips: [['把 OCR 设为“全部页面 OCR”', 'Set OCR to "OCR all pages"'], ['或改用“图片模式”', 'Or use image mode']] });
         const sample = paras.slice(0, 50).map(p => p.text).join('');
         lang = (sample.match(new RegExp(CJK_RE.source, 'g')) || []).length > sample.length * 0.2 ? 'zh' : 'en';
-        if (ocrCount) ctx.log(`OCR pages: ${ocrCount}`);
+        if (ocrCount) ctx.log(`OCR pages: ${ocrCount}; garbage lines dropped: ${st.droppedLines}; low-confidence words dropped: ${st.droppedWords}; words re-checked: ${st.rechecked} (changed ${st.fixed})`);
+        if (st.images) ctx.log(`illustrations embedded: ${st.images}`);
         // 4) 分章
         ctx.progress(0.8, L(['分章…', 'Building chapters…']));
         const isChapRe = p => p.text.length < 60 && CHAPTER_RE.test(p.text);
@@ -4428,7 +4795,7 @@ Registry.register({
           else if (n12 >= 2) splitAt = p => p.level === 1 || p.level === 2 || isChapRe(p);
           else if (paras.filter(isChapRe).length >= 2) splitAt = isChapRe;
         }
-        const para = p => p.level ? `<h${clamp(p.level + 2, 3, 6)}>${escXml(p.text)}</h${clamp(p.level + 2, 3, 6)}>` : `<p>${escXml(p.text)}</p>`;
+        const para = p => p.img ? `<div style="text-align:center;margin:0.8em 0"><img src="${p.img}" alt="" style="max-width:100%;height:auto"/></div>` : p.level ? `<h${clamp(p.level + 2, 3, 6)}>${escXml(p.text)}</h${clamp(p.level + 2, 3, 6)}>` : `<p>${escXml(p.text)}</p>`;
         if (splitAt) {
           let cur = null;
           for (const p of paras) {
