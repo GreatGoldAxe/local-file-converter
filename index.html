@@ -129,6 +129,32 @@ details.limits ul{margin:6px 0;padding-left:20px;font-size:13px}
 .opt input[type=range]{width:100%}
 .actions{display:flex;gap:8px;align-items:center;margin-top:16px;flex-wrap:wrap}
 
+/* ========== 预览面板 ========== */
+.pv{margin-top:16px;border:1px solid var(--line);border-radius:var(--radius);background:var(--panel2);overflow:hidden}
+.pv-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+.pv-head h3{margin:0;font-size:14px;flex:1;min-width:150px}
+.pv-head select{max-width:min(240px,100%);padding:4px 8px;border:1px solid var(--line);border-radius:7px;background:var(--panel)}
+.pv-note{padding:8px 12px 0;font-size:12.5px;color:var(--muted)}
+.pv-stale{padding:6px 12px 0;color:var(--warn)}
+.pv-status{padding:8px 12px;font-size:12.5px;color:var(--muted);word-break:break-word}
+.pv-status:empty{display:none}
+.pv-status .bar{margin-top:6px}
+.pv-body{padding:0 12px 12px;display:flex;flex-direction:column;gap:16px}
+.pv-body:empty{display:none}
+.pv-body .notice{margin:0}
+.pv-body .notice ul{margin:2px 0 4px}
+.pv-page{margin:0;min-width:0}
+.pv-page figcaption{display:flex;justify-content:space-between;gap:4px 10px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin-bottom:6px}
+.pv-page figcaption span:last-child{word-break:break-all}
+.pv-sheet{background:#fff;border-radius:4px;box-shadow:var(--shadow),0 0 0 1px var(--line);overflow:hidden}
+.pv-sheet canvas{display:block;width:100%;height:auto}
+.pv-img{display:flex;justify-content:center;align-items:center;padding:10px;border-radius:6px;border:1px solid var(--line);background:repeating-conic-gradient(rgba(128,128,128,.22) 0 25%,transparent 0 50%) 0 0/16px 16px}
+.pv-img canvas{display:block;max-width:100%;max-height:70vh;width:auto;height:auto}
+.pv-paper{background:#fff;color:#111;border-radius:4px;box-shadow:var(--shadow),0 0 0 1px var(--line);margin:0 auto;box-sizing:border-box}
+.pv-win{overflow:hidden}
+.pv-text{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:10px 12px;font-family:var(--mono);font-size:12.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.pv-info{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 12px;font-size:13px;word-break:break-word}
+
 /* ========== 首页总览 ========== */
 .matrix{width:100%;border-collapse:collapse;font-size:13px}
 .matrix th,.matrix td{border-bottom:1px solid var(--line);padding:7px 6px;text-align:left;vertical-align:top}
@@ -782,6 +808,7 @@ function renderView() {
   const view = $('#view');
   view.innerHTML = '';
   const conv = Registry.get(state.view);
+  previewOnView(conv ? conv.id : null);
   if (!conv) renderHome(view); else renderConverter(view, conv);
 }
 
@@ -874,9 +901,11 @@ function renderConverter(view, conv) {
 
   view.appendChild(h('div', { class: 'actions' }, [
     h('button', { class: 'btn primary', onclick: () => startConversion(conv) }, '▶ ' + t('start')),
+    canPreview(conv) ? h('button', { class: 'btn', id: 'btnPreview', title: L(['只转换前 3 页，在下方查看效果', 'Convert only the first 3 pages and show them below']), onclick: () => runPreview(conv) }, '👁 ' + L(['预览前 3 页', 'Preview first 3 pages'])) : null,
     h('span', { class: 'muted small', id: 'startHint' })
   ]));
   updateStartHint(conv);
+  mountPreview(view, conv);
 }
 
 function renderOptions(conv, box) {
@@ -1299,6 +1328,358 @@ function applyI18n() {
   $('#envbar').title = `protocol: ${location.protocol} · crossOriginIsolated: ${!!window.crossOriginIsolated}`;
   renderNav(); renderView(); renderTasks();
 }
+
+/* =====================================================================
+ * 2.8 预览：只转换并渲染结果的前 3 页（本地运行，不进任务队列、不下载）
+ * 复用转换器自身的 run()，只在调用前缩小输入范围：
+ *   - 带“页码范围”选项的转换器：把范围改为所选页中的前 3 页
+ *   - 合并类（批量）转换器：只取前 3 个文件；PDF 输入先裁成前 3 页
+ *   - 经 htmlToPdf 生成 PDF 的转换器：ctx.maxPages 让其只排版前 3 页
+ * ===================================================================== */
+const PREVIEW_PAGES = 3;
+const PREVIEW_CATS = new Set(['pdf', 'word', 'image', 'ocr', 'ebook', 'ppt']);
+const PV_TRIM_PDF = new Set(['pdf-merge', 'to-pptx']);   // 先把输入 PDF 裁成前 3 页的转换器
+const PV_IMG_EXT = new Set(['jpg', 'jpeg', 'png', 'webp', 'avif', 'gif', 'bmp', 'ico', 'tif', 'tiff']);
+const PV_TEXT_EXT = new Set(['txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'srt', 'vtt', 'log']);
+const PV_TEXT_LINES = 45, PV_TEXT_CHARS = 4000;   // 纯文本按约 45 行 / 4000 字估算为一页
+const PV_PAPER_W = 680, PV_PAPER_PAD = 40;         // 文档类预览的纸张内容宽度与边距（px）
+const canPreview = conv => !!conv && conv.runnable && PREVIEW_CATS.has(conv.cat);
+
+const Preview = { conv: null, el: null, ctrl: null, task: null, running: false, startId: null, sig: '' };
+
+const pvPageLabel = n => `${L(['第 ', 'Page '])}${n}${L([' 页', ''])}`;
+const pvSig = conv => JSON.stringify([getOut(conv), getOpts(conv)]);
+
+/** 视图切换时调用：离开当前转换器则取消并关闭预览 */
+function previewOnView(id) {
+  if (Preview.conv && Preview.conv.id !== id) closePreview();
+}
+function closePreview() {
+  if (Preview.ctrl) Preview.ctrl.abort();
+  if (Preview.el) Preview.el.remove();
+  Object.assign(Preview, { conv: null, el: null, ctrl: null, running: false, startId: null, sig: '' });
+}
+
+/** 在转换器视图中挂载预览面板（重绘视图时保留已生成的预览内容） */
+function mountPreview(view, conv) {
+  if (!Preview.el || Preview.conv !== conv) return;
+  renderPreviewHead(conv);
+  const stale = Preview.el.querySelector('.pv-stale');
+  if (stale) stale.classList.toggle('hidden', Preview.running || !Preview.sig || Preview.sig === pvSig(conv));
+  view.appendChild(Preview.el);
+  fitPreviewPapers();
+}
+
+function ensurePreviewPanel(conv) {
+  if (Preview.el && Preview.conv === conv) return Preview.el;
+  if (Preview.el) Preview.el.remove();
+  Preview.conv = conv;
+  Preview.el = h('div', { class: 'pv', id: 'previewPanel' }, [
+    h('div', { class: 'pv-head' }),
+    h('div', { class: 'pv-note' }, L(['预览在本地浏览器中生成，只转换前 3 页，不会上传文件，也不会加入任务列表。确认效果后再点击“开始转换”导出完整文件。', 'The preview is generated locally in your browser and converts only the first 3 pages. Nothing is uploaded or added to the task list. Click "Convert" afterwards to export the full file.'])),
+    h('div', { class: 'pv-stale muted small hidden' }, '⚠ ' + L(['输出格式或选项已更改，点击“重新预览”查看最新效果', 'Output or options changed — click "Preview again" to refresh'])),
+    h('div', { class: 'pv-status' }),
+    h('div', { class: 'pv-body' })
+  ]);
+  const view = $('#view');
+  if (view) view.appendChild(Preview.el);
+  return Preview.el;
+}
+
+function renderPreviewHead(conv) {
+  const head = Preview.el.querySelector('.pv-head');
+  head.innerHTML = '';
+  const files = state.files.filter(f => accepts(conv, f.file));
+  const mode = pvMode(conv);
+  let sel = null;
+  if (mode === 'each' && files.length > 1) {
+    sel = h('select', { title: L(['从哪个文件开始预览', 'File to preview']), 'aria-label': L(['预览文件', 'Preview file']) }, files.map(f => h('option', { value: f.id }, f.file.name)));
+    sel.value = files.some(f => f.id === Preview.startId) ? Preview.startId : files[0].id;
+    sel.onchange = () => { Preview.startId = sel.value; runPreview(conv); };
+  }
+  head.append(
+    h('h3', null, '👁 ' + L(['预览前 3 页', 'Preview first 3 pages'])),
+    sel || '',
+    Preview.running
+      ? h('button', { class: 'btn sm', onclick: () => { if (Preview.ctrl) Preview.ctrl.abort(); } }, t('cancel'))
+      : h('button', { class: 'btn sm', onclick: () => runPreview(conv) }, '↻ ' + L(['重新预览', 'Preview again'])),
+    h('button', { class: 'btn ghost sm', title: t('close'), 'aria-label': t('close'), onclick: closePreview }, '✕')
+  );
+}
+
+const pvMode = conv => { const o = getOpts(conv); return typeof conv.mode === 'function' ? conv.mode(o, getOut(conv)) : (conv.mode || 'each'); };
+
+function pvStatus(msg, p) {
+  const box = Preview.el && Preview.el.querySelector('.pv-status');
+  if (!box) return;
+  box.innerHTML = '';
+  if (msg) box.appendChild(h('div', null, msg));
+  if (p !== undefined) box.appendChild(h('div', { class: 'bar' + (p === null ? ' indet' : '') }, h('i', { style: `width:${Math.round((p || 0) * 100)}%` })));
+}
+
+/** 生成预览 */
+async function runPreview(conv) {
+  if (!canPreview(conv)) return;
+  const files = state.files.filter(f => accepts(conv, f.file));
+  if (!files.length) { toast({ type: 'warn', title: t('noCompatible'), body: `${t('accept')}: ${conv.inputs.join(', ')}` }); return; }
+  // 取消上一次预览，并等它退出（释放 OCR 等独占资源）后再开始
+  const prev = Preview.task;
+  if (Preview.ctrl) Preview.ctrl.abort();
+  const ctrl = new AbortController();
+  Preview.ctrl = ctrl;
+  Preview.task = (async () => { if (prev) await prev.catch(() => { }); if (Preview.ctrl === ctrl) await pvRun(conv, files, ctrl); })();
+  return Preview.task;
+}
+
+async function pvRun(conv, files, ctrl) {
+  const el = ensurePreviewPanel(conv);
+  const body = el.querySelector('.pv-body');
+  body.innerHTML = '';
+  Object.assign(Preview, { ctrl, running: true, sig: pvSig(conv) });
+  renderPreviewHead(conv);
+  el.querySelector('.pv-stale').classList.add('hidden');
+  if (el.getBoundingClientRect().top > window.innerHeight - 80) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  const opts = { ...getOpts(conv) };
+  const output = getOut(conv);
+  const mode = pvMode(conv);
+  const signal = ctrl.signal;
+  const warns = [];
+  let stage = 'convert', base = 0, span = 1, holdsExclusive = false;
+  const t0 = Date.now();
+  const ctx = {
+    files: [], file: null, opts, output, signal, job: { warnings: warns }, preview: true, maxPages: PREVIEW_PAGES,
+    check() { if (signal.aborted) throw abortErr(); },
+    progress(p, msg) { if (Preview.ctrl === ctrl) pvStatus(msg || L(['正在生成预览…', 'Generating preview…']), p === null || p === undefined ? null : base + span * clamp(p, 0, 1)); },
+    log(m, lvl) { log(`[${L(['预览', 'Preview'])} · ${L(conv.name)}] ${m}`, lvl); },
+    warn(m) { warns.push(m); log(`[${L(['预览', 'Preview'])} · ${L(conv.name)}] ${m}`, 'warn'); },
+    onAbort(fn) { if (signal.aborted) fn(); else signal.addEventListener('abort', fn, { once: true }); }
+  };
+  let shown = 0, srcTotal = 0;
+  try {
+    // OCR 等独占资源：正式任务在用时不预览；预览期间占用，避免与任务抢同一个引擎
+    if (conv.exclusive) {
+      if (runningExclusive.has(conv.exclusive)) throw userErr('PREVIEW_BUSY', ['有同类任务（OCR）正在运行，暂时无法预览', 'A task using the same engine (OCR) is running'], { tips: [['等待右侧任务完成后再预览，或先取消该任务', 'Wait for the running task to finish, or cancel it, then preview again']] });
+      runningExclusive.add(conv.exclusive); holdsExclusive = true;
+    }
+    ctx.progress(null, conv.libs.length ? t('loadingLib') + '…' : undefined);
+    if (conv.libs.length) await loadLibs(conv.libs);
+    ctx.check();
+    // 要运行的文件组：批量模式取前 3 个文件合成一次；逐个模式从所选文件开始，最多 3 个文件
+    let groups;
+    if (mode === 'batch') groups = [files.slice(0, PREVIEW_PAGES).map(f => f.file)];
+    else {
+      const start = Math.max(0, files.findIndex(f => f.id === Preview.startId));
+      groups = files.slice(start, start + PREVIEW_PAGES).map(f => [f.file]);
+    }
+    for (let gi = 0; gi < groups.length && shown < PREVIEW_PAGES; gi++) {
+      ctx.check();
+      stage = 'convert';
+      base = gi / groups.length; span = 0.85 / groups.length;
+      const inFiles = await pvLimitInput(conv, groups[gi], opts, ctx);
+      if (inFiles.total) srcTotal = Math.max(srcTotal, inFiles.total);
+      ctx.files = inFiles.files; ctx.file = inFiles.files[0];
+      ctx.progress(0, L(['正在转换前 3 页…', 'Converting the first 3 pages…']));
+      const res = await conv.run({ ...ctx, opts: inFiles.opts });
+      ctx.check();
+      const results = (Array.isArray(res) ? res : [res]).filter(r => r && r.blob);
+      if (!results.length) throw userErr('NO_OUTPUT', ['没有生成任何输出', 'No output was produced'], { causes: [['文件内容为空或所选页码不存在', 'Empty content or the selected pages do not exist']] });
+      stage = 'render';
+      ctx.progress(0.9, L(['正在渲染预览…', 'Rendering preview…']));
+      for (const r of results) {
+        if (shown >= PREVIEW_PAGES) break;
+        const items = await pvRenderResult(r, PREVIEW_PAGES - shown, ctx, groups[gi], results.length > 1);
+        ctx.check();
+        for (const it of items) {
+          shown += it.pages === undefined ? 1 : it.pages;
+          body.appendChild(it.node);
+        }
+      }
+    }
+    fitPreviewPapers();
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    const msg = [`✓ ${L(['预览完成', 'Preview ready'])}`, `${L(['显示', 'showing'])} ${shown} ${L(['页', shown === 1 ? 'page' : 'pages'])}`, `${secs}s`];
+    if (srcTotal > PREVIEW_PAGES) msg.push(L([`原文件共 ${srcTotal} 页，正式转换将处理全部所选页面`, `the source has ${srcTotal} pages; the full conversion processes all selected pages`]));
+    pvStatus(msg.join(' · '));
+    if (warns.length) Preview.el.querySelector('.pv-status').appendChild(h('div', { style: 'color:var(--warn);margin-top:4px' }, '⚠ ' + [...new Set(warns)].slice(-3).join(' / ')));
+  } catch (e) {
+    if (Preview.ctrl !== ctrl) return;   // 已被新的预览取代
+    if (isAbort(e) || signal.aborted) { pvStatus(L(['预览已取消', 'Preview canceled'])); }
+    else {
+      const d = diagnose(e, conv);
+      log(`✗ ${L(['预览失败', 'Preview failed'])}: ${e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e}`, 'error');
+      pvStatus('');
+      const title = stage === 'render'
+        ? L(['转换成功，但无法在页面中显示该结果的预览', 'The conversion worked, but this result cannot be shown as a preview'])
+        : L(['预览失败', 'Preview failed']);
+      const tips = stage === 'render' ? [['可以直接点击“开始转换”，下载后用对应软件查看效果', 'You can still click "Convert" and open the downloaded file in a suitable app'], ...d.tips] : d.tips;
+      body.prepend(h('div', { class: 'notice err' }, [
+        h('div', null, [h('b', null, title + '：'), d.reason]),
+        d.causes.length ? h('div', null, [h('b', null, t('causes') + '：'), h('ul', null, d.causes.map(c => h('li', null, L(c))))]) : null,
+        tips.length ? h('div', null, [h('b', null, t('suggestions') + '：'), h('ul', null, tips.map(c => h('li', null, L(c))))]) : null
+      ]));
+    }
+  } finally {
+    if (holdsExclusive) { runningExclusive.delete(conv.exclusive); pump(); }
+    if (Preview.ctrl === ctrl) {
+      Preview.running = false;
+      if (Preview.el && Preview.conv === conv) renderPreviewHead(conv);
+    }
+  }
+}
+
+/** 缩小输入：返回 { files, opts, total }，total 为源文件页数（已知时） */
+async function pvLimitInput(conv, files, opts, ctx) {
+  const o = { ...opts };
+  let total = 0;
+  if (conv.options.includes(OPT_PAGES)) {
+    // 页码范围选项：在用户所选范围内取前 3 页
+    const f = files[0], ext = getExt(f.name);
+    if (ext === 'pdf') {
+      const pdf = await openPdf(await f.arrayBuffer(), o.password);
+      total = pdf.numPages; pdf.destroy();
+    } else if (['pptx', 'ppsx', 'potx'].includes(ext)) {
+      total = (await openPptx(await f.arrayBuffer())).slides.length;
+    }
+    if (total) o.pages = flatPages(o.pages, total).slice(0, PREVIEW_PAGES).join(',');
+    return { files, opts: o, total };
+  }
+  if (PV_TRIM_PDF.has(conv.id)) {
+    const out = [];
+    for (const f of files) {
+      if (getExt(f.name) !== 'pdf') { out.push(f); continue; }
+      const r = await pvTrimPdf(f, PREVIEW_PAGES);
+      total = Math.max(total, r.total);
+      out.push(r.file);
+    }
+    return { files: out, opts: o, total };
+  }
+  return { files, opts: o, total };
+}
+/** 用 pdf-lib 把 PDF 裁成前 n 页；加密或解析失败时原样返回，由转换器给出原有的错误提示 */
+async function pvTrimPdf(file, n) {
+  try {
+    await loadLib('pdflib');
+    const src = await PDFLib.PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true, updateMetadata: false });
+    const total = src.getPageCount();
+    if (src.isEncrypted || total <= n) return { file, total };
+    const out = await PDFLib.PDFDocument.create();
+    (await out.copyPages(src, Array.from({ length: n }, (_, i) => i))).forEach(p => out.addPage(p));
+    return { file: new File([await out.save()], file.name, { type: 'application/pdf', lastModified: file.lastModified }), total };
+  } catch (e) { return { file, total: 0 }; }
+}
+
+/* ---------- 结果渲染：每种输出格式渲染最多 max 页 ---------- */
+function pvFigure(label, extra, content) {
+  return h('figure', { class: 'pv-page' }, [h('figcaption', null, [h('span', null, label), extra ? h('span', null, extra) : null]), content]);
+}
+async function pvRenderResult(r, max, ctx, srcFiles, multi) {
+  const ext = getExt(r.name);
+  const tag = `${r.name} · ${fmtSize(r.blob.size)}`;
+  if (ext === 'pdf') return pvRenderPdf(r, max, ctx, tag, multi);
+  if (PV_IMG_EXT.has(ext)) {
+    const c = await decodeToCanvas(new File([r.blob], r.name), ctx);
+    const src = srcFiles.length === 1 && PV_IMG_EXT.has(getExt(srcFiles[0].name)) ? srcFiles[0] : null;
+    const cmp = src ? ` · ${L(['原文件', 'original'])} ${fmtSize(src.size)}${r.blob.size !== src.size ? ` (${r.blob.size < src.size ? '−' : '+'}${Math.abs(Math.round((1 - r.blob.size / src.size) * 100))}%)` : ''}` : '';
+    return [{ node: pvFigure(r.name, `${c.width}×${c.height}px · ${fmtSize(r.blob.size)}${cmp}`, h('div', { class: 'pv-img' }, c)) }];
+  }
+  if (ext === 'docx') {
+    await loadLib('mammoth');
+    const root = await docxToHtmlRoot(new File([r.blob], r.name), ctx);
+    return pvHtmlPages(root.innerHTML, max, tag, L(['Word 文档没有固定分页，以下按 A4 页面估算显示', 'Word documents have no fixed pages; shown as estimated A4 pages']));
+  }
+  if (ext === 'epub') {
+    const book = await readEpub(await r.blob.arrayBuffer(), { images: true }, ctx);
+    const toc = book.chapters.map((c, i) => c.title || L(['第 ', 'Chapter ']) + (i + 1) + L([' 章', ''])).slice(0, 12);
+    const info = `《${book.title}》${book.author ? ' · ' + book.author : ''} · ${book.chapters.length} ${L(['章', 'chapters'])}：${toc.join(' / ')}${book.chapters.length > 12 ? ' …' : ''}`;
+    const html = book.chapters.map(c => `<section>${sanitizeHtml(c.html).innerHTML}</section>`).join('<div class="pdf-pagebreak"></div>');
+    const pages = await pvHtmlPages(html, max, tag, L(['电子书为流式排版，以下按 A4 页面估算显示（每章另起一页）', 'E-books are reflowable; shown as estimated A4 pages (each chapter starts a new page)']));
+    return [{ node: h('div', { class: 'pv-info' }, info), pages: 0 }, ...pages];
+  }
+  if (ext === 'pptx') {
+    const P = await openPptx(await r.blob.arrayBuffer());
+    const out = [];
+    for (let i = 0; i < Math.min(max, P.slides.length); i++) {
+      ctx.check();
+      const c = await renderSlide(await loadSlide(P, P.slides[i]), 1280);
+      out.push({ node: pvFigure(`${L(['幻灯片 ', 'Slide '])}${i + 1} / ${P.slides.length}`, i === 0 ? tag : '', h('div', { class: 'pv-sheet' }, c)) });
+    }
+    return out;
+  }
+  if (ext === 'html' || ext === 'htm') return pvHtmlPages(sanitizeHtml(await r.blob.text()).innerHTML, max, tag, L(['网页没有固定分页，以下按 A4 页面估算显示', 'Web pages have no fixed pages; shown as estimated A4 pages']));
+  if (PV_TEXT_EXT.has(ext)) return pvTextPages(await r.blob.text(), max, tag);
+  return [{ node: h('div', { class: 'pv-info' }, `📎 ${tag} — ${L([`.${ext} 格式无法在页面中直接预览，正式转换后可下载查看`, `.${ext} files cannot be previewed in the page; convert and download to view`])}`) }];
+}
+
+async function pvRenderPdf(r, max, ctx, tag, multi) {
+  const pdf = await openPdf(await r.blob.arrayBuffer());
+  const out = [];
+  try {
+    const n = Math.min(max, pdf.numPages);
+    for (let i = 1; i <= n; i++) {
+      ctx.check();
+      const page = await pdf.getPage(i);
+      const w = page.getViewport({ scale: 1 }).width;
+      page.cleanup();
+      const c = await renderPdfPage(pdf, i, clamp(1100 / w, 0.5, 2.5), ctx);
+      // 多个输出文件（如拆分）时以文件名标注
+      out.push({ node: pvFigure(multi ? `${r.name} · ${pvPageLabel(i)}` : pvPageLabel(i), multi ? fmtSize(r.blob.size) : i === 1 ? tag : '', h('div', { class: 'pv-sheet' }, c)) });
+    }
+  } finally { pdf.destroy(); }
+  return out;
+}
+
+/** HTML → 按 A4 比例分页，取前 max 页（分页算法与 htmlToPdf 相同） */
+async function pvHtmlPages(html, max, tag, hint) {
+  if (!$('#pvDocCss')) document.head.appendChild(h('style', { id: 'pvDocCss' }, PDF_CSS));
+  const pageH = Math.round(PV_PAPER_W * 1.48);
+  const inner = h('div', { class: 'pdfdoc', html });
+  const meas = h('div', { style: `position:absolute;left:-40000px;top:0;width:${PV_PAPER_W}px;background:#fff` }, inner);
+  document.body.appendChild(meas);
+  let pages;
+  try {
+    await Promise.race([
+      Promise.all(Array.from(inner.querySelectorAll('img')).map(img => img.complete ? null : new Promise(res => { img.onload = img.onerror = res; }))),
+      new Promise(res => setTimeout(res, 4000))
+    ]);
+    pages = computePageBreaks(inner, pageH);
+  } finally { meas.remove(); }
+  const shown = pages.slice(0, max);
+  return shown.map(([s, e], i) => {
+    const clone = inner.cloneNode(true);
+    clone.style.marginTop = (-s) + 'px';
+    const paper = h('div', { class: 'pv-paper', style: `width:${PV_PAPER_W + 2 * PV_PAPER_PAD}px;padding:${PV_PAPER_PAD}px` }, h('div', { class: 'pv-win', style: `width:${PV_PAPER_W}px;height:${Math.max(1, Math.ceil(e - s))}px` }, clone));
+    const label = `${pvPageLabel(i + 1)}${pages.length > max ? '' : ' / ' + pages.length}`;
+    return { node: pvFigure(label, i === 0 ? tag : '', i === 0 && hint ? h('div', null, [h('div', { class: 'muted small', style: 'margin-bottom:6px' }, hint), paper]) : paper) };
+  });
+}
+
+/** 纯文本按行数/字数切分为页 */
+function pvTextPages(text, max, tag) {
+  const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
+  const pages = [];
+  let cur = [], chars = 0;
+  for (const ln of lines) {
+    if (cur.length && (cur.length >= PV_TEXT_LINES || chars + ln.length > PV_TEXT_CHARS)) { pages.push(cur.join('\n')); cur = []; chars = 0; if (pages.length >= max) break; }
+    // 超长的单行按字数切开
+    let s = ln;
+    while (s.length > PV_TEXT_CHARS) { pages.push(s.slice(0, PV_TEXT_CHARS)); s = s.slice(PV_TEXT_CHARS); if (pages.length >= max) break; }
+    if (pages.length >= max) break;
+    cur.push(s); chars += s.length;
+  }
+  if (cur.length && pages.length < max) pages.push(cur.join('\n'));
+  if (!pages.length || !pages.some(p => p.trim())) return [{ node: pvFigure(pvPageLabel(1), tag, h('div', { class: 'pv-info' }, L(['结果为空（没有提取到文字）', 'The result is empty (no text extracted)']))) }];
+  return pages.slice(0, max).map((p, i) => ({ node: pvFigure(pvPageLabel(i + 1), i === 0 ? tag : '', h('pre', { class: 'pv-text' }, p)) }));
+}
+
+/** 纸张固定宽度，窄屏按比例缩小 */
+function fitPreviewPapers() {
+  const body = Preview.el && Preview.el.querySelector('.pv-body');
+  if (!body || !body.isConnected) return;
+  const avail = body.clientWidth - 24;
+  body.querySelectorAll('.pv-paper').forEach(p => { p.style.zoom = String(Math.min(1, avail / (PV_PAPER_W + 2 * PV_PAPER_PAD))); });
+}
+window.addEventListener('resize', () => { if (Preview.el) fitPreviewPapers(); });
 
 /* =====================================================================
  * 3. 处理引擎
@@ -2110,6 +2491,7 @@ async function htmlToPdf(html, ctx, { orientation = 'portrait', pageSize = 'a4',
     }
     const pageH = Math.floor(contentW * (ph - 2 * marginMm) / (pw - 2 * marginMm));
     const pages = computePageBreaks(inner, pageH);
+    if (ctx.maxPages && pages.length > ctx.maxPages) pages.length = ctx.maxPages;   // 预览：只渲染前几页
     ctx.log(`PDF: ${pages.length} pages, content ${contentW}px`);
     // 控制画布尺寸
     let sc = Math.min(scale, 4000 / contentW);

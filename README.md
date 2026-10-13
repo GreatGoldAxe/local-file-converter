@@ -11,8 +11,9 @@ A single-file, in-browser file converter. **All conversions run locally in your 
 - 打开上面的链接，或下载 `index.html` 后双击用浏览器打开。
 - 左侧选择功能 → 拖拽 / 点击 / 粘贴添加文件 → 选择输出格式 → 开始转换 → 在右侧下载或打包 ZIP。
 - 推荐最新版 Chrome / Edge / Firefox。
+- **预览前 3 页**：PDF、Word / 文档、图片、OCR、电子书、PPT 类功能在“开始转换”旁有“预览前 3 页”按钮，只转换并显示结果的前 3 页（图片为前 3 张），用于先检查排版和质量；预览同样在本地完成，不会加入任务列表。
 
-Open the link above, or download `index.html` and double-click it. Pick a feature, add files (drag, click or paste), choose the output, convert, then download or ZIP the results.
+Open the link above, or download `index.html` and double-click it. Pick a feature, add files (drag, click or paste), choose the output, convert, then download or ZIP the results. For PDF, document, image, OCR, e-book and PPT tools, **Preview first 3 pages** converts and shows only the first 3 pages of the result (first 3 images for image tools) so you can check layout and quality before the full conversion — also fully local.
 
 ## 功能 / Features
 
