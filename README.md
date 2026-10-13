@@ -12,8 +12,9 @@ A single-file, in-browser file converter. **All conversions run locally in your 
 - 左侧选择功能 → 拖拽 / 点击 / 粘贴添加文件 → 选择输出格式 → 开始转换 → 在右侧下载或打包 ZIP。
 - 推荐最新版 Chrome / Edge / Firefox。
 - **预览前 3 页**：PDF、Word / 文档、图片、OCR、电子书、PPT 类功能在“开始转换”旁有“预览前 3 页”按钮，只转换并显示结果的前 3 页（图片为前 3 张），用于先检查排版和质量；预览同样在本地完成，不会加入任务列表。
+- **暂停 / 继续**：逐页或逐个文件处理的任务（PDF 转图片 / 文本 / Word、扫描 PDF OCR、图片 OCR、PDF 转 EPUB、PPT 导出、合并与拆分等）在任务列表中有“暂停”按钮，当前页完成后暂停，点“继续”从下一页接着处理，不会从头开始。音视频（ffmpeg）和单步完成的转换不支持暂停，只能取消。暂停中的任务仍占用一个并发名额。
 
-Open the link above, or download `index.html` and double-click it. Pick a feature, add files (drag, click or paste), choose the output, convert, then download or ZIP the results. For PDF, document, image, OCR, e-book and PPT tools, **Preview first 3 pages** converts and shows only the first 3 pages of the result (first 3 images for image tools) so you can check layout and quality before the full conversion — also fully local.
+Open the link above, or download `index.html` and double-click it. Pick a feature, add files (drag, click or paste), choose the output, convert, then download or ZIP the results. For PDF, document, image, OCR, e-book and PPT tools, **Preview first 3 pages** converts and shows only the first 3 pages of the result (first 3 images for image tools) so you can check layout and quality before the full conversion — also fully local. Page-by-page and file-by-file tasks (PDF to images/text/Word, OCR, PDF to EPUB, PPT export, merge/split…) can be **paused** in the task list: the task stops after the current page and **Resume** continues with the next page instead of starting over. Audio/video (ffmpeg) and single-step conversions can only be canceled. A paused task keeps its slot in the queue.
 
 ## 功能 / Features
 

@@ -182,9 +182,11 @@ details.limits ul{margin:6px 0;padding-left:20px;font-size:13px}
 .st-done{background:var(--ok-weak);color:var(--ok)}
 .st-error{background:var(--err-weak);color:var(--err)}
 .st-canceled{background:var(--panel2);color:var(--muted)}
+.st-paused{background:var(--warn-weak);color:var(--warn)}
 .bar{height:6px;background:var(--panel2);border-radius:99px;overflow:hidden;margin-top:6px}
 .bar > i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
 .bar.indet > i{width:30% !important;animation:indet 1.2s infinite ease-in-out}
+.bar.paused > i{background:var(--warn)}
 @keyframes indet{0%{margin-left:-30%}100%{margin-left:100%}}
 .results{margin-top:6px;display:flex;flex-direction:column;gap:4px}
 .result{display:flex;align-items:center;gap:6px;font-size:12.5px}
@@ -1050,7 +1052,9 @@ function addFiles(files) {
 }
 
 /* =====================================================================
- * 2.4 任务调度（并发限制、独占资源、取消）
+ * 2.4 任务调度（并发限制、独占资源、取消、暂停）
+ * 暂停：逐页/逐文件处理的转换器在循环中调用 await ctx.step()；用户点暂停后，
+ * 当前页完成即停在该处，继续后从下一页接着做。暂停中的任务仍占用并发名额与独占资源（如 OCR 引擎）。
  * ===================================================================== */
 let runningCount = 0;
 const runningExclusive = new Set();
@@ -1100,6 +1104,20 @@ async function runJob(job) {
   const ctx = {
     files: job.files, file: job.files[0], opts: job.opts, output: job.output, signal, job,
     check() { if (signal.aborted) throw abortErr(); },
+    /** 逐页/逐文件的检查点：可取消，也可在此暂停 */
+    async step() {
+      if (signal.aborted) throw abortErr();
+      if (!job.pausable) { job.pausable = true; renderTasks(); }
+      if (!job.pauseReq) return;
+      job.paused = true; renderTasks();
+      try {
+        await new Promise((res, rej) => {
+          job.resume = res;
+          signal.addEventListener('abort', () => rej(abortErr()), { once: true });
+        });
+      } finally { job.paused = false; job.resume = null; }
+      renderTasks();
+    },
     progress(p, msg) {
       if (p === null || p === undefined) job.indeterminate = true;
       else { job.indeterminate = false; job.progress = clamp(p, 0, 1); }
@@ -1111,7 +1129,7 @@ async function runJob(job) {
     onAbort(fn) { if (signal.aborted) fn(); else signal.addEventListener('abort', fn, { once: true }); }
   };
   try {
-    if (conv.libs.length) { ctx.progress(null, t('loadingLib') + '…'); await loadLibs(conv.libs); }
+    if (conv.libs.length) { ctx.progress(null, t('loadingLib') + '…'); await loadLibs(conv.libs); ctx.progress(null, ''); }
     ctx.check();
     const res = await conv.run(ctx);
     ctx.check();
@@ -1123,11 +1141,13 @@ async function runJob(job) {
       return { name, blob: r.blob };
     });
     if (!job.results.length) throw userErr('NO_OUTPUT', ['没有生成任何输出', 'No output was produced'], { causes: [['文件内容为空或所选页码/工作表不存在', 'Empty content or selected pages/sheets do not exist']] });
+    job.pauseReq = false;
     job.status = 'done'; job.progress = 1; job.indeterminate = false;
     job.msg = `${job.results.length} ${t('results')} · ${fmtSize(job.results.reduce((a, r) => a + r.blob.size, 0))} · ${((Date.now() - job.started) / 1000).toFixed(1)}s`;
     batchStats.ok++;
     log(`✓ ${job.title} → ${job.results.map(r => r.name).slice(0, 5).join(', ')}${job.results.length > 5 ? '…' : ''}`, 'ok');
   } catch (e) {
+    job.pauseReq = false;
     if (isAbort(e) || signal.aborted) { job.status = 'canceled'; job.msg = t('canceled'); }
     else {
       job.status = 'error';
@@ -1152,7 +1172,24 @@ function cancelJob(job) {
   if (job.status === 'queued') { job.status = 'canceled'; job.msg = t('canceled'); renderTasks(); return; }
   if (job.status === 'running') { job.msg = L(['正在取消…', 'Canceling…']); job.ctrl.abort(); updateJobUI(job); }
 }
+function pauseJob(job) {
+  if (job.status !== 'running') return;
+  job.pauseReq = true;
+  renderTasks();
+}
+function resumeJob(job) {
+  job.pauseReq = false;
+  if (job.resume) job.resume();
+  renderTasks();
+}
+/** 任务状态下方的说明文字（暂停时在进度信息前加上暂停提示） */
+function jobSubText(job) {
+  if (job.status === 'running' && job.paused) return `⏸ ${L(['已暂停', 'Paused'])}${job.msg ? ' · ' + job.msg : ''}`;
+  if (job.status === 'running' && job.pauseReq) return `⏸ ${L(['当前页完成后暂停…', 'Pausing after the current page…'])}${job.msg ? ' · ' + job.msg : ''}`;
+  return job.msg || '';
+}
 function retryJob(job) {
+  job.pauseReq = false; job.pausable = false;
   job.status = 'queued'; job.error = null; job.results = []; job.progress = 0; job.indeterminate = true; job.msg = '';
   job.ctrl = new AbortController();
   renderTasks(); pump();
@@ -1174,10 +1211,16 @@ function renderTasksNow() {
   $('#taskCount').textContent = state.jobs.length ? `(${active}/${state.jobs.length})` : '';
   if (!state.jobs.length) { box.appendChild(h('div', { class: 'empty' }, t('noTasks'))); return; }
   for (const job of state.jobs) {
-    const st = h('span', { class: 'st st-' + job.status }, t(job.status));
-    const bar = h('div', { class: 'bar' + (job.status === 'running' && job.indeterminate ? ' indet' : '') }, h('i', { style: `width:${Math.round(job.progress * 100)}%` }));
-    const sub = h('div', { class: 't-sub' }, job.msg || '');
+    const paused = job.status === 'running' && job.paused;
+    const st = h('span', { class: 'st st-' + (paused ? 'paused' : job.status) }, paused ? L(['已暂停', 'Paused']) : t(job.status));
+    const bar = h('div', { class: 'bar' + (paused ? ' paused' : job.status === 'running' && job.indeterminate ? ' indet' : '') }, h('i', { style: `width:${Math.round(job.progress * 100)}%` }));
+    const sub = h('div', { class: 't-sub' }, jobSubText(job));
     const ops = [];
+    if (job.status === 'running' && job.pausable) {
+      ops.push(job.pauseReq
+        ? h('button', { class: 'btn sm', title: L(['从暂停处继续', 'Continue from where it paused']), onclick: () => resumeJob(job) }, '▶ ' + L(['继续', 'Resume']))
+        : h('button', { class: 'btn sm', title: L(['当前页完成后暂停，继续时从下一页接着处理', 'Pause after the current page; Resume continues with the next page']), onclick: () => pauseJob(job) }, '⏸ ' + L(['暂停', 'Pause'])));
+    }
     if (job.status === 'running' || job.status === 'queued') ops.push(h('button', { class: 'btn sm', onclick: () => cancelJob(job) }, t('cancel')));
     if (job.status === 'error' || job.status === 'canceled') ops.push(h('button', { class: 'btn sm', onclick: () => retryJob(job) }, t('retry')));
     if (job.status !== 'running') ops.push(h('button', { class: 'btn ghost sm', title: t('remove'), onclick: () => { state.jobs = state.jobs.filter(j => j !== job); renderTasks(); } }, '✕'));
@@ -1213,9 +1256,9 @@ function renderTasksNow() {
 function updateJobUI(job) {
   if (!job._el) return renderTasks();
   const { bar, sub } = job._el;
-  bar.className = 'bar' + (job.indeterminate ? ' indet' : '');
+  bar.className = 'bar' + (job.paused ? ' paused' : job.indeterminate ? ' indet' : '');
   bar.firstChild.style.width = Math.round(job.progress * 100) + '%';
-  sub.textContent = job.msg || '';
+  sub.textContent = jobSubText(job);
 }
 
 /* =====================================================================
@@ -1450,6 +1493,7 @@ async function pvRun(conv, files, ctrl) {
   const ctx = {
     files: [], file: null, opts, output, signal, job: { warnings: warns }, preview: true, maxPages: PREVIEW_PAGES,
     check() { if (signal.aborted) throw abortErr(); },
+    async step() { if (signal.aborted) throw abortErr(); },   // 预览不支持暂停
     progress(p, msg) { if (Preview.ctrl === ctrl) pvStatus(msg || L(['正在生成预览…', 'Generating preview…']), p === null || p === undefined ? null : base + span * clamp(p, 0, 1)); },
     log(m, lvl) { log(`[${L(['预览', 'Preview'])} · ${L(conv.name)}] ${m}`, lvl); },
     warn(m) { warns.push(m); log(`[${L(['预览', 'Preview'])} · ${L(conv.name)}] ${m}`, 'warn'); },
@@ -2499,7 +2543,7 @@ async function htmlToPdf(html, ctx, { orientation = 'portrait', pageSize = 'a4',
     const pdf = new jspdf.jsPDF({ orientation, unit: 'mm', format: [pw, ph].sort((a, b) => a - b), compress: true });
     let first = true, done = 0;
     for (let i = 0; i < pages.length;) {
-      ctx.check();
+      await ctx.step();
       // 把若干页合并为一次截图，减少 html2canvas 调用
       let j = i, cs = pages[i][0], ce = pages[i][1];
       while (j + 1 < pages.length && pages[j + 1][1] - cs <= Math.min(maxChunk, 6000)) { j++; ce = pages[j][1]; }
@@ -2702,7 +2746,7 @@ async function htmlToDocx(root, opts = {}, ctx) {
   for (let i = 0; i < list.length; i++) {
     try { const info = await imageForDocx(list[i].getAttribute('src')); if (info) imgs.set(list[i], info); }
     catch (e) { if (ctx) ctx.warn(L(['有图片无法嵌入，已跳过', 'An image could not be embedded and was skipped'])); }
-    if (ctx && i % 5 === 0) { ctx.check(); ctx.progress(null, L([`处理图片 ${i + 1}/${list.length}`, `Images ${i + 1}/${list.length}`])); }
+    if (ctx && i % 5 === 0) { await ctx.step(); ctx.progress(null, L([`处理图片 ${i + 1}/${list.length}`, `Images ${i + 1}/${list.length}`])); }
   }
   const out = [];
   docxWalk(root, { p: {}, depth: 0 }, out, db, imgs);
@@ -2844,7 +2888,7 @@ async function readEpub(buf, { images = true } = {}, ctx) {
   const imgCache = {};
   const chapters = [];
   for (let i = 0; i < spine.length; i++) {
-    if (ctx) { ctx.check(); ctx.progress(0.05 + 0.6 * i / spine.length, L([`读取章节 ${i + 1}/${spine.length}`, `Reading chapter ${i + 1}/${spine.length}`])); }
+    if (ctx) { await ctx.step(); ctx.progress(0.05 + 0.6 * i / spine.length, L([`读取章节 ${i + 1}/${spine.length}`, `Reading chapter ${i + 1}/${spine.length}`])); }
     const f = zip.file(spine[i].href);
     if (!f) continue;
     const src = await f.async('string');
@@ -4095,7 +4139,7 @@ Registry.register({
   async run(ctx) {
     const out = await PDFLib.PDFDocument.create();
     for (let i = 0; i < ctx.files.length; i++) {
-      ctx.check(); ctx.progress(i / ctx.files.length, `${i + 1}/${ctx.files.length} ${ctx.files[i].name}`);
+      await ctx.step(); ctx.progress(i / ctx.files.length, `${i + 1}/${ctx.files.length} ${ctx.files[i].name}`);
       const src = await loadPdfLib(ctx.files[i], ctx);
       const pages = await out.copyPages(src, src.getPageIndices());
       pages.forEach(p => out.addPage(p));
@@ -4126,7 +4170,7 @@ Registry.register({
     else groups = Array.from({ length: n }, (_, i) => [i + 1]);
     const res = [];
     for (let i = 0; i < groups.length; i++) {
-      ctx.check(); ctx.progress(i / groups.length, `${i + 1}/${groups.length}`);
+      await ctx.step(); ctx.progress(i / groups.length, `${i + 1}/${groups.length}`);
       const out = await PDFLib.PDFDocument.create();
       (await out.copyPages(src, groups[i].map(p => p - 1))).forEach(p => out.addPage(p));
       const g = groups[i];
@@ -4181,7 +4225,7 @@ Registry.register({
     const res = [];
     try {
       for (let i = 0; i < pages.length; i++) {
-        ctx.check(); ctx.progress(i / pages.length, `${L(['第', 'Page '])}${pages[i]}${L([' 页', ''])} (${i + 1}/${pages.length})`);
+        await ctx.step(); ctx.progress(i / pages.length, `${L(['第', 'Page '])}${pages[i]}${L([' 页', ''])} (${i + 1}/${pages.length})`);
         const c = await renderPdfPage(pdf, pages[i], (+ctx.opts.dpi || 150) / 72, ctx);
         res.push({ name: outName(ctx.file.name, ctx.output, '_p' + pad(pages[i])), blob: await encodeCanvas(c, ctx.output, { quality: ctx.opts.quality }) });
         c.width = c.height = 0;
@@ -4205,7 +4249,7 @@ Registry.register({
     let chars = 0;
     try {
       for (let i = 0; i < pages.length; i++) {
-        ctx.check(); ctx.progress(i / pages.length, `${i + 1}/${pages.length}`);
+        await ctx.step(); ctx.progress(i / pages.length, `${i + 1}/${pages.length}`);
         const page = await pdf.getPage(pages[i]);
         const paras = linesToParagraphs(await pdfPageLines(page));
         page.cleanup();
@@ -4247,7 +4291,7 @@ Registry.register({
     let ocrPages = 0;
     try {
       for (let i = 0; i < pages.length; i++) {
-        ctx.check();
+        await ctx.step();
         const base = i / pages.length, span = 1 / pages.length;
         ctx.progress(base, `${i + 1}/${pages.length}`);
         if (i > 0 && o.pageBreaks) db.body.push(db.pageBreak());
@@ -4297,7 +4341,7 @@ Registry.register({
     const o = ctx.opts;
     const doc = await PDFLib.PDFDocument.create();
     for (let i = 0; i < ctx.files.length; i++) {
-      ctx.check(); ctx.progress(i / ctx.files.length, `${i + 1}/${ctx.files.length} ${ctx.files[i].name}`);
+      await ctx.step(); ctx.progress(i / ctx.files.length, `${i + 1}/${ctx.files.length} ${ctx.files[i].name}`);
       let c = await decodeToCanvas(ctx.files[i], ctx);
       if (+o.maxSide > 0) c = applyResize(c, { resizeMode: 'maxside', maxSide: o.maxSide });
       const usePng = !o.jpeg;
@@ -4705,7 +4749,7 @@ Registry.register({
   async run(ctx) {
     const texts = [];
     for (let i = 0; i < ctx.files.length; i++) {
-      ctx.check();
+      await ctx.step();
       const f = ctx.files[i];
       const c = await ocrPrep(await decodeToCanvas(f, ctx), ctx.opts);
       texts.push({ label: f.name, text: await ocrCanvas(c, ctx, ctx.opts.lang, `${i + 1}/${ctx.files.length}`, i / ctx.files.length, 1 / ctx.files.length) });
@@ -4727,7 +4771,7 @@ Registry.register({
     const texts = [];
     try {
       for (let i = 0; i < pages.length; i++) {
-        ctx.check();
+        await ctx.step();
         const c = await renderPdfPage(pdf, pages[i], (+ctx.opts.dpi || 200) / 72, ctx);
         texts.push({ label: `${L(['第', 'Page '])}${pages[i]}${L([' 页', ''])}`, text: await ocrCanvas(c, ctx, ctx.opts.lang, `${i + 1}/${pages.length}`, i / pages.length, 1 / pages.length) });
         c.width = c.height = 0;
@@ -4968,7 +5012,7 @@ Registry.register({
     }
     if (out === 'md') {
       const md = [];
-      for (const c of book.chapters) { ctx.check(); md.push(await htmlToMarkdown(sanitizeHtml(c.html).innerHTML)); }
+      for (const c of book.chapters) { await ctx.step(); md.push(await htmlToMarkdown(sanitizeHtml(c.html).innerHTML)); }
       return { name: name + '.md', blob: new Blob([`# ${book.title}\n\n${md.join('\n\n---\n\n')}\n`], { type: MIME.md }) };
     }
     if (out === 'docx') return { name: name + '.docx', blob: await htmlToDocx(sanitizeHtml(epubCombinedHtml(book, { toc: false, breaks: true })), { title: book.title }, ctx) };
@@ -5066,7 +5110,7 @@ Registry.register({
     try {
       if (o.mode === 'image') {
         for (let i = 0; i < pages.length; i++) {
-          ctx.check(); ctx.progress(i / pages.length, `${i + 1}/${pages.length}`);
+          await ctx.step(); ctx.progress(i / pages.length, `${i + 1}/${pages.length}`);
           const pg = await pdf.getPage(pages[i]);
           const w1 = pg.getViewport({ scale: 1 }).width;
           const c = await renderPdfPage(pdf, pages[i], clamp((+o.imgWidth || 1200) / w1, 0.3, 5), ctx);
@@ -5082,7 +5126,7 @@ Registry.register({
         const st = { droppedLines: 0, droppedWords: 0, rechecked: 0, fixed: 0, images: 0 };
         let ocrCount = 0;
         for (let i = 0; i < pages.length; i++) {
-          ctx.check(); ctx.progress(0.7 * i / pages.length, L([`读取第 ${pages[i]} 页`, `Reading page ${pages[i]}`]));
+          await ctx.step(); ctx.progress(0.7 * i / pages.length, L([`读取第 ${pages[i]} 页`, `Reading page ${pages[i]}`]));
           const page = await pdf.getPage(pages[i]);
           let lines = await pdfPageLines(page);
           const len = lines.reduce((a, l) => a + l.text.replace(/\s/g, '').length, 0);
@@ -5423,7 +5467,7 @@ Registry.register({
     let pdf = null;
     if (out === 'pdf') await loadLib('jspdf');
     for (let i = 0; i < idx.length; i++) {
-      ctx.check(); ctx.progress(i / idx.length, `${i + 1}/${idx.length}`);
+      await ctx.step(); ctx.progress(i / idx.length, `${i + 1}/${idx.length}`);
       const R = await loadSlide(P, P.slides[idx[i] - 1]);
       if (out === 'txt' || out === 'md') {
         const body = pptSlideText(R, out === 'md');
@@ -5465,11 +5509,11 @@ Registry.register({
     const pushCanvas = async c => { const alpha = canvasHasAlpha(c); const b = alpha ? await canvasToBlob(c, 'image/png') : await canvasToBlob(flatten(c), 'image/jpeg', o.quality); imgs.push({ w: c.width, h: c.height, data: (alpha ? 'image/png;base64,' : 'image/jpeg;base64,') + bytesToBase64(new Uint8Array(await b.arrayBuffer())) }); };
     for (let i = 0; i < ctx.files.length; i++) {
       const f = ctx.files[i];
-      ctx.check(); ctx.progress(0.8 * i / ctx.files.length, `${i + 1}/${ctx.files.length} ${f.name}`);
+      await ctx.step(); ctx.progress(0.8 * i / ctx.files.length, `${i + 1}/${ctx.files.length} ${f.name}`);
       if (getExt(f.name) === 'pdf') {
         await loadLib('pdfjs');
         const pdf = await openPdf(await f.arrayBuffer());
-        try { for (let p = 1; p <= pdf.numPages; p++) { ctx.check(); ctx.progress(null, `${f.name} p${p}/${pdf.numPages}`); await pushCanvas(await renderPdfPage(pdf, p, (+o.dpi || 150) / 72, ctx)); } }
+        try { for (let p = 1; p <= pdf.numPages; p++) { await ctx.step(); ctx.progress(null, `${f.name} p${p}/${pdf.numPages}`); await pushCanvas(await renderPdfPage(pdf, p, (+o.dpi || 150) / 72, ctx)); } }
         finally { pdf.destroy(); }
       } else await pushCanvas(applyResize(await decodeToCanvas(f, ctx), { resizeMode: 'maxside', maxSide: 3000 }));
     }
@@ -5599,7 +5643,7 @@ Registry.register({
     }
     const pdf = await openPdf(buf);
     const res = [];
-    try { for (let p = 1; p <= pdf.numPages; p++) { ctx.check(); ctx.progress(p / pdf.numPages); const c = await renderPdfPage(pdf, p, (+ctx.opts.dpi || 150) / 72, ctx, null); res.push({ name: outName(ctx.file.name, 'png', pdf.numPages > 1 ? '_p' + pad(p) : ''), blob: await canvasToBlob(c, 'image/png') }); } }
+    try { for (let p = 1; p <= pdf.numPages; p++) { await ctx.step(); ctx.progress(p / pdf.numPages); const c = await renderPdfPage(pdf, p, (+ctx.opts.dpi || 150) / 72, ctx, null); res.push({ name: outName(ctx.file.name, 'png', pdf.numPages > 1 ? '_p' + pad(p) : ''), blob: await canvasToBlob(c, 'image/png') }); } }
     finally { pdf.destroy(); }
     return res;
   }
